@@ -1,12 +1,16 @@
 package models
 
+import "prosecure-payment-api/services/payment/authorizenet"
+
 type PaymentRequest struct {
-    CardName    string       `json:"cardname"`
-    CardNumber  string       `json:"cardnumber"`
-    CVV         string       `json:"cvv"`
-    Expiry      string       `json:"expiry"`
-    CheckoutID  string       `json:"sid"`
-    ThreeDSData *ThreeDSData `json:"threeDSData,omitempty"`
+    CardName      string                       `json:"cardname"`
+    CardNumber    string                       `json:"cardnumber"`
+    CVV           string                       `json:"cvv"`
+    Expiry        string                       `json:"expiry"`
+    CheckoutID    string                       `json:"sid"`
+    CustomerEmail string                       `json:"email,omitempty"`
+    BillingInfo   *authorizenet.BillingInfoType `json:"-"` // Preenchido pelo handler
+    ThreeDSData   *ThreeDSData                 `json:"threeDSData,omitempty"`
 }
 
 type CardData struct {

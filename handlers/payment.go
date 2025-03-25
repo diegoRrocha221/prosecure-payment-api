@@ -62,6 +62,7 @@ func sendSuccessResponse(w http.ResponseWriter, response models.APIResponse) {
     json.NewEncoder(w).Encode(response)
 }
 
+// ProcessPayment processa um pagamento
 func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
     requestID := uuid.New().String()
     log.Printf("[RequestID: %s] Starting payment processing", requestID)
@@ -161,7 +162,8 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
 
-
+    // Verificar se a transação foi aprovada antes de enfileirar tarefas em background
+    // Somente enfileiramos jobs para transações aprovadas
     if resp.Success {
         // Enqueue background tasks for void transaction and subscription creation
         h.enqueueBackgroundTasks(requestID, &req, resp.TransactionID)

@@ -54,35 +54,45 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
     // Criar um ID de pedido único para evitar duplicações
     orderID := fmt.Sprintf("Order-%s-%d", req.CheckoutID, time.Now().UnixNano())
     
+    // Construir a solicitação básica
+    txRequest := transactionRequestType{
+        TransactionType: "authOnlyTransaction",
+        Amount:         "1.00",
+        Payment: &PaymentType{
+            CreditCard: CreditCardType{
+                CardNumber:     req.CardNumber,
+                ExpirationDate: req.Expiry,
+                CardCode:       req.CVV,
+            },
+        },
+        // Adicionar informações do pedido para controle de duplicação
+        Order: &OrderType{
+            InvoiceNumber: orderID,
+            Description:   "ProSecure Validation Charge",
+        },
+        // Adicionar configuração de janela de duplicação
+        DuplicateWindow: DuplicateWindow,
+    }
+    
+    // Adicionar informações do cliente se disponíveis
+    if req.CustomerEmail != "" {
+        txRequest.Customer = &CustomerType{
+            Type:  "individual",
+            Email: req.CustomerEmail,
+        }
+    }
+    
+    // Adicionar informações de faturamento se disponíveis
+    if req.BillingInfo != nil {
+        txRequest.BillTo = req.BillingInfo
+    }
+    
+    // Construir a solicitação completa
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
             RefID: req.CheckoutID,
-            TransactionRequest: transactionRequestType{
-                TransactionType: "authOnlyTransaction",
-                Amount:         "1.00",
-                Payment: &PaymentType{
-                    CreditCard: CreditCardType{
-                        CardNumber:     req.CardNumber,
-                        ExpirationDate: req.Expiry,
-                        CardCode:       req.CVV,
-                    },
-                },
-                // Adicionar informações do pedido para controle de duplicação
-                Order: &OrderType{
-                    InvoiceNumber: orderID,
-                    Description:   "ProSecure Validation Charge",
-                },
-                // Adicionar configuração de janela de duplicação
-                DuplicateWindow: DuplicateWindow,
-                // Adicionar informações do cliente para melhorar a detecção de fraudes
-                Customer: &CustomerType{
-                    Type:  "individual",
-                    Email: req.CustomerEmail,
-                },
-                // Adicionar informações de faturamento para melhorar a autorização
-                BillTo: req.BillingInfo,
-            },
+            TransactionRequest: txRequest,
         },
     }
 
