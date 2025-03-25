@@ -40,7 +40,32 @@ func (w *Worker) Start(concurrency int) {
 		go w.processJobs(i)
 	}
 	
-	log.Printf("Started %d worker goroutines", concurrency)
+	// Start a goroutine to process delayed jobs
+	go w.processDelayedJobs()
+	
+	log.Printf("Started %d worker goroutines and delayed job processor", concurrency)
+}
+
+// processDelayedJobs periodically checks for delayed jobs that are ready to be processed
+func (w *Worker) processDelayedJobs() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-w.shutdown:
+			log.Println("Delayed job processor shutting down")
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := w.queue.ProcessDelayedJobs(ctx)
+			cancel()
+			
+			if err != nil {
+				log.Printf("Error processing delayed jobs: %v", err)
+			}
+		}
+	}
 }
 
 // Stop signals the worker to stop processing jobs
@@ -75,12 +100,14 @@ func (w *Worker) processJobs(workerID int) {
 			}
 			
 			if job == nil {
+				// No jobs available, wait before trying again
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
 			
 			log.Printf("Worker %d processing job %s of type %s", workerID, job.ID, job.Type)
 			
+			// Process the job
 			jobErr := w.processJob(job)
 			if jobErr != nil {
 				log.Printf("Worker %d: Error processing job %s: %v", workerID, job.ID, jobErr)
@@ -93,10 +120,12 @@ func (w *Worker) processJobs(workerID int) {
 					log.Printf("Worker %d: Error marking job %s as failed: %v", workerID, job.ID, failErr)
 				}
 				
+				// Wait a bit after an error
 				time.Sleep(time.Second)
 				continue
 			}
 			
+			// Mark job as complete
 			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
 			completeErr := w.queue.CompleteJob(ctx, job)
 			cancel()
@@ -108,6 +137,7 @@ func (w *Worker) processJobs(workerID int) {
 	}
 }
 
+// processJob processes a single job
 func (w *Worker) processJob(job *queue.Job) error {
 	switch job.Type {
 	case queue.JobTypeVoidTransaction:
@@ -119,6 +149,7 @@ func (w *Worker) processJob(job *queue.Job) error {
 	}
 }
 
+// processVoidTransaction voids an authorized transaction
 func (w *Worker) processVoidTransaction(job *queue.Job) error {
 	transactionID, ok := job.Data["transaction_id"].(string)
 	if !ok || transactionID == "" {
@@ -130,18 +161,21 @@ func (w *Worker) processVoidTransaction(job *queue.Job) error {
 	return w.paymentService.VoidTransaction(transactionID)
 }
 
+// processCreateSubscription sets up a recurring billing subscription
 func (w *Worker) processCreateSubscription(job *queue.Job) error {
-
+	// Extract data from job
 	checkoutID, ok := job.Data["checkout_id"].(string)
 	if !ok || checkoutID == "" {
 		return fmt.Errorf("invalid checkout_id in job data")
 	}
 	
+	// Get checkout data
 	checkout, err := w.db.GetCheckoutData(checkoutID)
 	if err != nil {
 		return fmt.Errorf("failed to get checkout data: %v", err)
 	}
 	
+	// Create payment request from stored data
 	paymentRequest := &models.PaymentRequest{
 		CardName:   job.Data["card_name"].(string),
 		CardNumber: job.Data["card_number"].(string),
@@ -152,6 +186,7 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 	
 	log.Printf("Setting up subscription for checkout %s", checkoutID)
 	
+	// Setup the subscription
 	err = w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
 	if err != nil {
 		return fmt.Errorf("failed to setup recurring billing: %v", err)
@@ -160,12 +195,15 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 	return nil
 }
 
+// Start a worker with configuration
 func StartWorker(cfg *config.Config, concurrency int) (*Worker, error) {
+	// Connect to database
 	db, err := database.NewConnection(cfg.Database)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %v", err)
 	}
 	
+	// Create payment service
 	paymentService := payment.NewPaymentService(
 		cfg.AuthNet.APILoginID,
 		cfg.AuthNet.TransactionKey,
@@ -173,11 +211,13 @@ func StartWorker(cfg *config.Config, concurrency int) (*Worker, error) {
 		cfg.AuthNet.Environment,
 	)
 	
+	// Connect to Redis queue
 	queue, err := queue.NewQueue(cfg.Redis.URL, "payment_jobs")
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %v", err)
 	}
 	
+	// Create and start worker
 	worker := NewWorker(queue, db, paymentService)
 	worker.Start(concurrency)
 	
