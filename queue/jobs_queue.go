@@ -1,11 +1,6 @@
 package queue
 
 import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"log"
-	"time"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -59,7 +54,9 @@ func NewQueue(redisURL, queueName string) (*Queue, error) {
 	}, nil
 }
 
-// Enqueue adds a job to the queue
+func (q *Queue) Client() *redis.Client {
+	return q.client
+}
 func (q *Queue) Enqueue(ctx context.Context, jobType JobType, data map[string]interface{}) error {
 	job := Job{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),

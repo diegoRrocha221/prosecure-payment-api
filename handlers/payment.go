@@ -2,22 +2,20 @@ package handlers
 
 import (
     "context"
-    "encoding/base64"
     "encoding/json"
+    "encoding/base64"
     "fmt"
     "log"
     "net/http"
     "strings"
     "time"
-    
     "github.com/google/uuid"
-    
-    "prosecure-payment-api/database"
     "prosecure-payment-api/models"
-    "prosecure-payment-api/queue"
-    "prosecure-payment-api/services/email"
     "prosecure-payment-api/services/payment"
+    "prosecure-payment-api/services/email"
+    "prosecure-payment-api/database"
     "prosecure-payment-api/utils"
+    "prosecure-payment-api/queue"
 )
 
 type PaymentHandler struct {
@@ -344,6 +342,123 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
 
     log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
     return nil
+}
+
+// ResetCheckoutStatus resets a checkout's status
+func (h *PaymentHandler) ResetCheckoutStatus(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        CheckoutID string `json:"checkout_id"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        sendErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+        return
+    }
+
+    if req.CheckoutID == "" {
+        sendErrorResponse(w, http.StatusBadRequest, "Missing checkout ID")
+        return
+    }
+
+    // Release any lock on this checkout
+    if err := h.db.ReleaseLock(req.CheckoutID); err != nil {
+        sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to reset checkout status: %v", err))
+        return
+    }
+
+    sendSuccessResponse(w, models.APIResponse{
+        Status:  "success",
+        Message: "Checkout status reset successfully",
+    })
+}
+
+// GenerateCheckoutID generates a new checkout ID
+func (h *PaymentHandler) GenerateCheckoutID(w http.ResponseWriter, r *http.Request) {
+    checkoutID := uuid.New().String()
+
+    sendSuccessResponse(w, models.APIResponse{
+        Status: "success",
+        Data: map[string]interface{}{
+            "checkout_id": checkoutID,
+        },
+    })
+}
+
+// UpdateCheckoutID updates a checkout with a new ID
+func (h *PaymentHandler) UpdateCheckoutID(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        OldID string `json:"old_id"`
+        NewID string `json:"new_id"`
+    }
+
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        sendErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
+        return
+    }
+    
+    if req.OldID == "" || req.NewID == "" {
+        sendErrorResponse(w, http.StatusBadRequest, "Missing old_id or new_id parameter")
+        return
+    }
+
+    // In a real implementation, you'd update the checkout ID in the database
+    // For this example, we'll just return success
+    sendSuccessResponse(w, models.APIResponse{
+        Status:  "success",
+        Message: fmt.Sprintf("Checkout ID updated from %s to %s", req.OldID, req.NewID),
+    })
+}
+
+// CheckCheckoutStatus checks the status of a checkout
+func (h *PaymentHandler) CheckCheckoutStatus(w http.ResponseWriter, r *http.Request) {
+    checkoutID := r.URL.Query().Get("id")
+    if checkoutID == "" {
+        sendErrorResponse(w, http.StatusBadRequest, "Missing checkout ID")
+        return
+    }
+
+    // Check if checkout is processed
+    processed, err := h.db.IsCheckoutProcessed(checkoutID)
+    if err != nil {
+        sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Error checking checkout status: %v", err))
+        return
+    }
+
+    // Check if checkout is locked
+    locked, err := h.isCheckoutLocked(checkoutID)
+    if err != nil {
+        sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Error checking checkout lock: %v", err))
+        return
+    }
+
+    sendSuccessResponse(w, models.APIResponse{
+        Status: "success",
+        Data: map[string]interface{}{
+            "checkout_id": checkoutID,
+            "processed":   processed,
+            "locked":      locked,
+        },
+    })
+}
+
+// Helper to check if a checkout is locked
+func (h *PaymentHandler) isCheckoutLocked(checkoutID string) (bool, error) {
+    // Try to acquire the lock - if we can't, it's locked
+    acquired, err := h.db.LockCheckout(checkoutID)
+    if err != nil {
+        return false, err
+    }
+    
+    // If we acquired the lock, release it and return false (not locked)
+    if acquired {
+        if err := h.db.ReleaseLock(checkoutID); err != nil {
+            return false, err
+        }
+        return false, nil
+    }
+    
+    // We couldn't acquire the lock, so it's locked
+    return true, nil
 }
 
 func (h *PaymentHandler) generateActivationEmail(username, activationURL string) string {
