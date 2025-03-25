@@ -26,10 +26,25 @@ type PaymentType struct {
 }
 
 type transactionRequestType struct {
-    TransactionType    string       `json:"transactionType"`
-    Amount            string       `json:"amount,omitempty"`
-    Payment           *PaymentType `json:"payment,omitempty"`
-    RefTransId        string       `json:"refTransId,omitempty"`
+    TransactionType    string          `json:"transactionType"`
+    Amount            string          `json:"amount,omitempty"`
+    Payment           *PaymentType    `json:"payment,omitempty"`
+    RefTransId        string          `json:"refTransId,omitempty"`
+    Order             *OrderType      `json:"order,omitempty"`
+    DuplicateWindow   int             `json:"duplicateWindow,omitempty"`
+    Customer          *CustomerType   `json:"customer,omitempty"`
+    BillTo            *BillingInfoType `json:"billTo,omitempty"`
+}
+
+type BillingInfoType struct {
+    FirstName   string `json:"firstName,omitempty"`
+    LastName    string `json:"lastName,omitempty"`
+    Address     string `json:"address,omitempty"`
+    City        string `json:"city,omitempty"`
+    State       string `json:"state,omitempty"`
+    Zip         string `json:"zip,omitempty"`
+    Country     string `json:"country,omitempty"`
+    PhoneNumber string `json:"phoneNumber,omitempty"`
 }
 
 type MessageType struct {
@@ -43,6 +58,12 @@ type MessagesType struct {
     Message    []MessageType `json:"message"`
 }
 
+type ErrorType struct {
+    ErrorCode              string `json:"errorCode"`
+    ErrorText              string `json:"errorText"`
+    OriginalTransactionID  string `json:"originalTransactionId,omitempty"`
+}
+
 type transactionResponse struct {
     ResponseCode   string        `json:"responseCode"`
     AuthCode      string        `json:"authCode"`
@@ -51,6 +72,7 @@ type transactionResponse struct {
     TransID       string        `json:"transId"`
     RefTransID    string        `json:"refTransId"`
     Messages      []MessageType `json:"messages,omitempty"`
+    Errors        []ErrorType  `json:"errors,omitempty"`
 }
 
 type createTransactionResponse struct {
@@ -88,7 +110,7 @@ type IntervalType struct {
 
 type CustomerType struct {
     Type        string `json:"type"`
-    Email       string `json:"email"`
+    Email       string `json:"email,omitempty"`
     PhoneNumber string `json:"phoneNumber,omitempty"`
 }
 

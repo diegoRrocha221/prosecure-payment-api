@@ -1,6 +1,11 @@
 package queue
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"time"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -54,9 +59,7 @@ func NewQueue(redisURL, queueName string) (*Queue, error) {
 	}, nil
 }
 
-func (q *Queue) Client() *redis.Client {
-	return q.client
-}
+// Enqueue adds a job to the queue
 func (q *Queue) Enqueue(ctx context.Context, jobType JobType, data map[string]interface{}) error {
 	job := Job{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -124,7 +127,7 @@ func (q *Queue) CompleteJob(ctx context.Context, job *Job) error {
 	return nil
 }
 
-// FailJob moves a job to the failed queue
+// FailJob handles job failure with retry logic
 func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 	job.RetryCount++
 	
@@ -132,22 +135,56 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 	job.Data["last_error"] = err.Error()
 	job.Data["failed_at"] = time.Now()
 
-	jobJSON, err := json.Marshal(job)
-	if err != nil {
-		return fmt.Errorf("failed to marshal job: %v", err)
+	// Define max retries
+	const maxRetries = 5
+	
+	jobJSON, marshalErr := json.Marshal(job)
+	if marshalErr != nil {
+		return fmt.Errorf("failed to marshal job: %v", marshalErr)
 	}
 
 	// Remove from processing queue
 	if err := q.client.LRem(ctx, q.processing, 1, jobJSON).Err(); err != nil {
 		log.Printf("Warning: Failed to remove job %s from processing queue: %v", job.ID, err)
 	}
-
-	// Add to failed queue
+	
+	// If we haven't reached max retries, put it back in the main queue with a delay
+	if job.RetryCount <= maxRetries {
+		// Calculate exponential backoff delay
+		// Base delay of 15 seconds with exponential increase (15s, 30s, 1m, 2m, 4m)
+		delaySeconds := 15 * (1 << (job.RetryCount - 1))
+		retryTime := time.Now().Add(time.Duration(delaySeconds) * time.Second)
+		
+		job.Data["next_retry_at"] = retryTime
+		
+		updatedJobJSON, _ := json.Marshal(job)
+		
+		// Use Redis ZADD with score as timestamp for delayed processing
+		delayedQueueName := q.queueName + ":delayed"
+		score := float64(retryTime.Unix())
+		
+		if err := q.client.ZAdd(ctx, delayedQueueName, &redis.Z{
+			Score:  score,
+			Member: updatedJobJSON,
+		}).Err(); err != nil {
+			log.Printf("Warning: Failed to add job to delayed queue, adding to failed queue: %v", err)
+			// Fall back to failed queue
+			if err := q.client.RPush(ctx, q.failed, updatedJobJSON).Err(); err != nil {
+				return fmt.Errorf("failed to push job to failed queue: %v", err)
+			}
+		}
+		
+		log.Printf("Job %s of type %s scheduled for retry %d/%d in %d seconds", 
+			job.ID, job.Type, job.RetryCount, maxRetries, delaySeconds)
+		return nil
+	}
+	
+	// If max retries exceeded, move to failed queue
 	if err := q.client.RPush(ctx, q.failed, jobJSON).Err(); err != nil {
 		return fmt.Errorf("failed to push job to failed queue: %v", err)
 	}
 
-	log.Printf("Moved job %s of type %s to failed queue", job.ID, job.Type)
+	log.Printf("Job %s of type %s moved to failed queue after %d retries", job.ID, job.Type, job.RetryCount)
 	return nil
 }
 
@@ -224,6 +261,11 @@ func (q *Queue) RetryJob(ctx context.Context, jobID string) error {
 	}
 
 	return fmt.Errorf("job %s not found in failed queue", jobID)
+}
+
+// Client returns the underlying Redis client for health checks
+func (q *Queue) Client() *redis.Client {
+	return q.client
 }
 
 // Close closes the Redis connection

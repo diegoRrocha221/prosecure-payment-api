@@ -15,6 +15,7 @@ import (
 const (
     SandboxEndpoint = "https://apitest.authorize.net/xml/v1/request.api"
     ProductionEndpoint = "https://api.authorize.net/xml/v1/request.api"
+    DuplicateWindow = 120 // Janela de duplicação em segundos (2 minutos)
 )
 
 type Client struct {
@@ -50,6 +51,9 @@ func (c *Client) getMerchantAuthentication() merchantAuthenticationType {
 }
 
 func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.TransactionResponse, error) {
+    // Criar um ID de pedido único para evitar duplicações
+    orderID := fmt.Sprintf("Order-%s-%d", req.CheckoutID, time.Now().UnixNano())
+    
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
@@ -64,6 +68,20 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
                         CardCode:       req.CVV,
                     },
                 },
+                // Adicionar informações do pedido para controle de duplicação
+                Order: &OrderType{
+                    InvoiceNumber: orderID,
+                    Description:   "ProSecure Validation Charge",
+                },
+                // Adicionar configuração de janela de duplicação
+                DuplicateWindow: DuplicateWindow,
+                // Adicionar informações do cliente para melhorar a detecção de fraudes
+                Customer: &CustomerType{
+                    Type:  "individual",
+                    Email: req.CustomerEmail,
+                },
+                // Adicionar informações de faturamento para melhorar a autorização
+                BillTo: req.BillingInfo,
             },
         },
     }
@@ -102,7 +120,40 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
         return nil, fmt.Errorf("error decoding response: %v, response body: %s", err, string(respBody))
     }
 
+    // Verificar se é um erro de transação duplicada
     if response.Messages.ResultCode == "Error" {
+        isDuplicate := false
+        duplicateTransID := ""
+        
+        for _, msg := range response.Messages.Message {
+            if msg.Code == "E00027" { // Código de erro de duplicação da Authorize.net
+                isDuplicate = true
+                // Tentar obter o ID da transação original
+                if response.TransactionResponse.Errors != nil && len(response.TransactionResponse.Errors) > 0 {
+                    for _, err := range response.TransactionResponse.Errors {
+                        if err.ErrorCode == "11" { // Código de erro de duplicação
+                            duplicateTransID = err.OriginalTransactionID
+                            break
+                        }
+                    }
+                }
+                break
+            }
+        }
+        
+        if isDuplicate && duplicateTransID != "" {
+            log.Printf("Detected duplicate transaction. Original transaction ID: %s", duplicateTransID)
+            
+            // Retornar a transação original como se fosse uma nova transação bem-sucedida
+            return &models.TransactionResponse{
+                Success:       true,
+                TransactionID: duplicateTransID,
+                Message:       "Transaction previously processed",
+                IsDuplicate:   true,
+            }, nil
+        }
+        
+        // Se não for duplicação ou não tiver ID da transação original, retornar erro normal
         if len(response.Messages.Message) > 0 {
             return &models.TransactionResponse{
                 Success: false,

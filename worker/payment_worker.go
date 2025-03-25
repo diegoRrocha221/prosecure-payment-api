@@ -163,34 +163,67 @@ func (w *Worker) processVoidTransaction(job *queue.Job) error {
 
 // processCreateSubscription sets up a recurring billing subscription
 func (w *Worker) processCreateSubscription(job *queue.Job) error {
-	// Extract data from job
+	log.Printf("Processing subscription creation job %s", job.ID)
+	
+	// Extrair dados do job
 	checkoutID, ok := job.Data["checkout_id"].(string)
 	if !ok || checkoutID == "" {
-		return fmt.Errorf("invalid checkout_id in job data")
+			return fmt.Errorf("invalid checkout_id in job data")
 	}
 	
-	// Get checkout data
+	// Obter dados do checkout
 	checkout, err := w.db.GetCheckoutData(checkoutID)
 	if err != nil {
-		return fmt.Errorf("failed to get checkout data: %v", err)
+			return fmt.Errorf("failed to get checkout data: %v", err)
 	}
 	
-	// Create payment request from stored data
+	// Criar objeto de requisição de pagamento com dados do job
 	paymentRequest := &models.PaymentRequest{
-		CardName:   job.Data["card_name"].(string),
-		CardNumber: job.Data["card_number"].(string),
-		Expiry:     job.Data["expiry"].(string),
-		CVV:        job.Data["cvv"].(string),
-		CheckoutID: checkoutID,
+			CardName:    job.Data["card_name"].(string),
+			CardNumber:  job.Data["card_number"].(string),
+			Expiry:      job.Data["expiry"].(string),
+			CVV:         job.Data["cvv"].(string),
+			CheckoutID:  checkoutID,
+			CustomerEmail: job.Data["email"].(string),
 	}
 	
 	log.Printf("Setting up subscription for checkout %s", checkoutID)
 	
-	// Setup the subscription
-	err = w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
+	// Configurar a assinatura recorrente
+	subscriptionResp, err := w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
 	if err != nil {
-		return fmt.Errorf("failed to setup recurring billing: %v", err)
+			return fmt.Errorf("failed to setup recurring billing: %v", err)
 	}
+	
+	if !subscriptionResp.Success {
+			return fmt.Errorf("subscription setup failed: %s", subscriptionResp.Message)
+	}
+	
+	// Atualizar o status da assinatura no banco de dados
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// Buscar o master_reference associado ao checkout
+	var masterRef string
+	err = w.db.GetDB().QueryRowContext(ctx, 
+			"SELECT master_reference FROM transactions WHERE checkout_id = ? LIMIT 1", 
+			checkoutID).Scan(&masterRef)
+	
+	if err != nil {
+			return fmt.Errorf("failed to get master reference: %v", err)
+	}
+	
+	// Atualizar a assinatura com o ID da assinatura da Authorize.net
+	_, err = w.db.GetDB().ExecContext(ctx, 
+			"UPDATE subscriptions SET subscription_id = ?, status = 'active' WHERE master_reference = ?", 
+			subscriptionResp.SubscriptionID, masterRef)
+	
+	if err != nil {
+			return fmt.Errorf("failed to update subscription with ARB ID: %v", err)
+	}
+	
+	log.Printf("Successfully set up subscription for checkout %s with subscription ID %s", 
+			checkoutID, subscriptionResp.SubscriptionID)
 	
 	return nil
 }

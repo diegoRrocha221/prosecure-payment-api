@@ -18,15 +18,15 @@ import (
     "prosecure-payment-api/database"
     "prosecure-payment-api/handlers"
     "prosecure-payment-api/queue"
-    "prosecure-payment-api/services/email"
     "prosecure-payment-api/services/payment"
+    "prosecure-payment-api/services/email"
     "prosecure-payment-api/worker"
 )
 
 func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Access-Control-Allow-Origin", "*")
-        w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT")
         w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization, h-captcha-response")
         if r.Method == "OPTIONS" {
             w.WriteHeader(http.StatusOK)
@@ -94,15 +94,6 @@ func main() {
     }
     log.Println("Successfully connected to database")
 
-    // Initialize payment and email services
-    paymentService := payment.NewPaymentService(
-        cfg.AuthNet.APILoginID,
-        cfg.AuthNet.TransactionKey,
-        cfg.AuthNet.MerchantID,
-        cfg.AuthNet.Environment,
-    )
-    emailService := email.NewSMTPService(cfg.SMTP)
-
     // Initialize Redis queue
     jobQueue, err := queue.NewQueue(cfg.Redis.URL, "payment_jobs")
     if err != nil {
@@ -111,13 +102,22 @@ func main() {
     defer jobQueue.Close()
     log.Println("Successfully connected to Redis")
 
+    // Initialize services
+    paymentService := payment.NewPaymentService(
+        cfg.AuthNet.APILoginID,
+        cfg.AuthNet.TransactionKey,
+        cfg.AuthNet.MerchantID,
+        cfg.AuthNet.Environment,
+    )
+    emailService := email.NewSMTPService(cfg.SMTP)
+
     // Start the worker
     paymentWorker := worker.NewWorker(jobQueue, db, paymentService)
     paymentWorker.Start(cfg.Redis.WorkerConcurrency)
     defer paymentWorker.Stop()
     log.Printf("Started payment worker with %d threads", cfg.Redis.WorkerConcurrency)
 
-    // Initialize payment handler
+    // Initialize handlers
     var paymentHandler *handlers.PaymentHandler
     for retries := 0; retries < 3; retries++ {
         paymentHandler, err = handlers.NewPaymentHandler(db, paymentService, emailService, jobQueue)
@@ -131,21 +131,37 @@ func main() {
         log.Fatalf("Failed to initialize payment handler after retries: %v", err)
     }
 
+    // Initialize webhook handler
+    webhookHandler := handlers.NewWebhookHandler(db, jobQueue, paymentService)
+
+    // Initialize other handlers
+    planHandler := handlers.NewPlanHandler(db)
+    cartHandler := handlers.NewCartHandler(db, cfg)
+    checkoutHandler := handlers.NewCheckoutHandler(db)
+    linkAccountHandler := handlers.NewLinkAccountHandler(db, cfg)
+
     // Set up router
     router := mux.NewRouter()
     router.Use(corsMiddleware)
     router.Use(loggingMiddleware)
 
-    planHandler := handlers.NewPlanHandler(db)
-    cartHandler := handlers.NewCartHandler(db, cfg)
-    checkoutHandler := handlers.NewCheckoutHandler(db)
-    linkAccountHandler := handlers.NewLinkAccountHandler(db, cfg)
     api := router.PathPrefix("/api").Subrouter()
+    
+    // Payment processing endpoints
     api.HandleFunc("/process-payment", paymentHandler.ProcessPayment).Methods("POST", "OPTIONS")
     api.HandleFunc("/reset-checkout-status", paymentHandler.ResetCheckoutStatus).Methods("POST", "OPTIONS")
     api.HandleFunc("/generate-checkout-id", paymentHandler.GenerateCheckoutID).Methods("GET")
     api.HandleFunc("/update-checkout-id", paymentHandler.UpdateCheckoutID).Methods("POST")
     api.HandleFunc("/check-checkout-status", paymentHandler.CheckCheckoutStatus).Methods("GET")
+    
+    // Webhook endpoints
+    webhookRouter := api.PathPrefix("/authorize-net/webhook").Subrouter()
+    webhookRouter.HandleFunc("/silent-post", webhookHandler.HandleSilentPost).Methods("POST")
+    webhookRouter.HandleFunc("/relay-response", webhookHandler.HandleRelayResponse).Methods("POST")
+    webhookRouter.HandleFunc("/subscription-notification", webhookHandler.HandleSubscriptionNotification).Methods("POST")
+    webhookRouter.HandleFunc("/store-payment-data", webhookHandler.StoreTemporaryPaymentData).Methods("POST")
+    
+    // Other existing endpoints
     api.HandleFunc("/checkout", checkoutHandler.UpdateCheckout).Methods("POST", "PUT", "OPTIONS")
     api.HandleFunc("/checkout", checkoutHandler.GetCheckout).Methods("GET", "OPTIONS")
     api.HandleFunc("/check-email-availability", checkoutHandler.CheckEmailAvailability).Methods("GET", "OPTIONS")
@@ -156,14 +172,15 @@ func main() {
     api.HandleFunc("/cart", cartHandler.GetCart).Methods("GET", "OPTIONS")
     api.HandleFunc("/cart/remove", cartHandler.RemoveFromCart).Methods("POST", "OPTIONS")
 
+    // Health check endpoint
     api.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
         health := struct {
             Status    string    `json:"status"`
-            Time     string    `json:"time"`
-            Database string    `json:"database"`
-            Redis    string    `json:"redis"`
+            Time      string    `json:"time"`
+            Database  string    `json:"database"`
+            Redis     string    `json:"redis"`
         }{
-            Status:    "ok",
+            Status:   "ok",
             Time:     time.Now().Format(time.RFC3339),
             Database: "connected",
             Redis:    "connected",
@@ -194,7 +211,6 @@ func main() {
         IdleTimeout:  60 * time.Second,
     }
 
-    // Start server in a goroutine so we can handle shutdown gracefully
     stop := make(chan os.Signal, 1)
     signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 

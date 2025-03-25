@@ -182,20 +182,20 @@ func (t *Transaction) SaveTransaction(masterRef string, checkoutID string, amoun
     return nil
 }
 
-func (t *Transaction) SaveSubscription(masterRef string, status string, nextBillingDate time.Time) error {
+func (t *Transaction) SaveSubscription(masterRef string, status string, nextBillingDate time.Time, subscriptionID string) error {
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
     
-    log.Printf("Attempting to save subscription: masterRef=%s, status=%s, nextBillingDate=%v", 
-        masterRef, status, nextBillingDate)
+    log.Printf("Attempting to save subscription: masterRef=%s, status=%s, nextBillingDate=%v, subscriptionID=%s", 
+        masterRef, status, nextBillingDate, subscriptionID)
 
     query := `
         INSERT INTO subscriptions (
-            id, master_reference, status, next_billing_date, created_at
-        ) VALUES (UUID(), ?, ?, ?, NOW())
+            id, master_reference, status, subscription_id, next_billing_date, created_at
+        ) VALUES (UUID(), ?, ?, ?, ?, NOW())
     `
     
-    _, err := t.tx.ExecContext(ctx, query, masterRef, status, nextBillingDate)
+    _, err := t.tx.ExecContext(ctx, query, masterRef, status, subscriptionID, nextBillingDate)
     if err != nil {
         log.Printf("Error saving subscription: %v", err)
         return fmt.Errorf("failed to save subscription: %v", err)

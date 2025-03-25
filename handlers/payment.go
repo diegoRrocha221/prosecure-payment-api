@@ -120,6 +120,19 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
 
+    // Preencher informações adicionais do cliente para evitar duplicações e melhorar taxas de aprovação
+    req.CustomerEmail = checkout.Email
+    req.BillingInfo = &authorizenet.BillingInfoType{
+        FirstName:   strings.Split(checkout.Name, " ")[0],
+        LastName:    strings.Join(strings.Split(checkout.Name, " ")[1:], " "),
+        Address:     checkout.Street,
+        City:        checkout.City,
+        State:       checkout.State,
+        Zip:         checkout.ZipCode,
+        Country:     "US",
+        PhoneNumber: checkout.PhoneNumber,
+    }
+
     // Validate card data before processing
     if !h.paymentService.ValidateCard(&req) {
         log.Printf("[RequestID: %s] Invalid card data", requestID)
@@ -148,8 +161,13 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
 
-    // Enqueue background tasks for void transaction and subscription creation
-    h.enqueueBackgroundTasks(requestID, &req, resp.TransactionID)
+
+    if resp.Success {
+        // Enqueue background tasks for void transaction and subscription creation
+        h.enqueueBackgroundTasks(requestID, &req, resp.TransactionID)
+    } else {
+        log.Printf("[RequestID: %s] Transaction not approved. No background tasks will be queued.", requestID)
+    }
 
     log.Printf("[RequestID: %s] Payment processed successfully for checkout ID: %s", requestID, req.CheckoutID)
 
@@ -297,7 +315,8 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         return fmt.Errorf("failed to save transaction: %v", err)
     }
 
-    if err := tx.SaveSubscription(masterUUID, "pending", futureDate); err != nil {
+    // Inicialmente, salvar com subscription_id vazio, será atualizado pelo worker
+    if err := tx.SaveSubscription(masterUUID, "pending", futureDate, ""); err != nil {
         tx.Rollback()
         return fmt.Errorf("failed to save subscription: %v", err)
     }
@@ -306,8 +325,26 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         return fmt.Errorf("failed to commit transaction: %v", err)
     }
 
-    // Generate activation code and send emails in the main thread
-    // We still want these to happen immediately after payment authorization
+    // Armazenar temporariamente os dados do cartão para uso pelo webhook
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    _, err = h.db.GetDB().ExecContext(ctx,
+        `INSERT INTO temp_payment_data
+         (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
+         VALUES (?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE
+         card_number = VALUES(card_number),
+         card_expiry = VALUES(card_expiry),
+         card_cvv = VALUES(card_cvv),
+         card_name = VALUES(card_name),
+         created_at = NOW()`,
+        checkout.ID, payment.CardNumber, payment.Expiry, payment.CVV, payment.CardName)
+    
+    if err != nil {
+        log.Printf("Warning: Failed to store temporary payment data: %v", err)
+    }
+
     code := utils.GenerateActivationCode()
     encodedUser := base64.StdEncoding.EncodeToString([]byte(checkout.Username))
     encodedEmail := base64.StdEncoding.EncodeToString([]byte(checkout.Email))
