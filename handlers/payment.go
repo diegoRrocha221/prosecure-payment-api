@@ -1,19 +1,22 @@
 package handlers
 
 import (
-    "crypto/sha256"
-    "encoding/json"
+    "context"
     "encoding/base64"
+    "encoding/json"
     "fmt"
     "log"
     "net/http"
     "strings"
     "time"
+    
     "github.com/google/uuid"
-    "prosecure-payment-api/models"
-    "prosecure-payment-api/services/payment"
-    "prosecure-payment-api/services/email"
+    
     "prosecure-payment-api/database"
+    "prosecure-payment-api/models"
+    "prosecure-payment-api/queue"
+    "prosecure-payment-api/services/email"
+    "prosecure-payment-api/services/payment"
     "prosecure-payment-api/utils"
 )
 
@@ -21,9 +24,10 @@ type PaymentHandler struct {
     db             *database.Connection
     paymentService *payment.Service
     emailService   *email.SMTPService
+    queue          *queue.Queue
 }
 
-func NewPaymentHandler(db *database.Connection, ps *payment.Service, es *email.SMTPService) (*PaymentHandler, error) {
+func NewPaymentHandler(db *database.Connection, ps *payment.Service, es *email.SMTPService, q *queue.Queue) (*PaymentHandler, error) {
     if db == nil {
         return nil, fmt.Errorf("database connection is required")
     }
@@ -33,11 +37,15 @@ func NewPaymentHandler(db *database.Connection, ps *payment.Service, es *email.S
     if es == nil {
         return nil, fmt.Errorf("email service is required")
     }
+    if q == nil {
+        return nil, fmt.Errorf("queue is required")
+    }
 
     return &PaymentHandler{
         db:             db,
         paymentService: ps,
         emailService:   es,
+        queue:          q,
     }, nil
 }
 
@@ -56,113 +64,16 @@ func sendSuccessResponse(w http.ResponseWriter, response models.APIResponse) {
     json.NewEncoder(w).Encode(response)
 }
 
-func generateShortID(prefix string, length int) string {
-    uuid := uuid.New()
-    hexUUID := uuid.String()
-    hexUUID = strings.ReplaceAll(hexUUID, "-", "")
-    startIndex := sha256.Sum256([]byte(hexUUID))
-    start := int(startIndex[0]) % (len(hexUUID) - length)
-    shortID := hexUUID[start : start+length]
-    
-    if prefix != "" {
-        shortID = prefix + shortID
-    }
-    
-    return shortID
-}
-
-func (h *PaymentHandler) GenerateCheckoutID(w http.ResponseWriter, r *http.Request) {
-    checkoutID := generateShortID("CHK", 6)
-    sendSuccessResponse(w, models.APIResponse{
-        Status:  "success",
-        Message: "Checkout ID generated successfully",
-        Data: map[string]string{
-            "checkout_id": checkoutID,
-        },
-    })
-}
-
-func (h *PaymentHandler) CheckCheckoutStatus(w http.ResponseWriter, r *http.Request) {
-    checkoutID := r.URL.Query().Get("checkout_id")
-    if checkoutID == "" {
-        sendErrorResponse(w, http.StatusBadRequest, "Checkout ID is required")
-        return
-    }
-
-    processed, err := h.db.IsCheckoutProcessed(checkoutID)
-    if err != nil {
-        sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-        return
-    }
-
-    sendSuccessResponse(w, models.APIResponse{
-        Status:  "success",
-        Message: "Checkout status retrieved successfully",
-        Data: map[string]bool{
-            "processed": processed,
-        },
-    })
-}
-
-func (h *PaymentHandler) PopulateCheckoutHistorics(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        CheckoutID   string  `json:"checkout_id"`
-        Name         string  `json:"name"`
-        Email        string  `json:"email"`
-        PhoneNumber  string  `json:"phoneNumber"`
-        ZipCode      string  `json:"zipcode"`
-        State        string  `json:"state"`
-        City         string  `json:"city"`
-        Street       string  `json:"street"`
-        Additional   string  `json:"additional"`
-        PlansJSON    string  `json:"plans_json"`
-        Plan         int     `json:"plan"`
-        Username     string  `json:"username"`
-        Passphrase   string  `json:"passphrase"`
-    }
-
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        sendErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
-        return
-    }
-
-    query := `
-        INSERT INTO checkout_historics (
-            checkout_id, name, email, phoneNumber, zipcode, state, city, street, additional, plans_json, plan, username, passphrase, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW())
-    `
-
-    _, err := h.db.GetDB().Exec(query,
-        req.CheckoutID,
-        req.Name,
-        req.Email,
-        req.PhoneNumber,
-        req.ZipCode,
-        req.State,
-        req.City,
-        req.Street,
-        req.Additional,
-        req.PlansJSON,
-        req.Plan,
-        req.Username,
-        req.Passphrase,
-    )
-
-    if err != nil {
-        sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to populate checkout historics: %v", err))
-        return
-    }
-
-    sendSuccessResponse(w, models.APIResponse{
-        Status:  "success",
-        Message: "Checkout historics populated successfully",
-    })
-}
-
-
 func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
-    requestID := generateShortID("REF", 15)
+    requestID := uuid.New().String()
     log.Printf("[RequestID: %s] Starting payment processing", requestID)
+
+    captchaToken := r.Header.Get("h-captcha-response")
+    if err := validateHCaptcha(captchaToken); err != nil {
+        log.Printf("[RequestID: %s] Captcha validation failed: %v", requestID, err)
+        sendErrorResponse(w, http.StatusBadRequest, "Security verification failed. Please try again.")
+        return
+    }
 
     var req models.PaymentRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -173,6 +84,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
 
     log.Printf("[RequestID: %s] Processing payment for checkout ID: %s", requestID, req.CheckoutID)
 
+    // Check if checkout was already processed
     processed, err := h.db.IsCheckoutProcessed(req.CheckoutID)
     if err != nil {
         log.Printf("[RequestID: %s] Error checking checkout status: %v", requestID, err)
@@ -200,7 +112,9 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         sendErrorResponse(w, http.StatusConflict, "This checkout is already being processed")
         return
     }
-
+    
+    defer h.db.ReleaseLock(req.CheckoutID)
+    
     checkout, err := h.db.GetCheckoutData(req.CheckoutID)
     if err != nil {
         log.Printf("[RequestID: %s] Invalid checkout ID: %v", requestID, err)
@@ -208,7 +122,15 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
 
-    resp, err := h.paymentService.ProcessPayment(&req, checkout)
+    // Validate card data before processing
+    if !h.paymentService.ValidateCard(&req) {
+        log.Printf("[RequestID: %s] Invalid card data", requestID)
+        sendErrorResponse(w, http.StatusBadRequest, "Invalid card data: please check card number, expiration date and CVV")
+        return
+    }
+
+    // Process initial payment authorization only
+    resp, err := h.paymentService.ProcessInitialAuthorization(&req)
     if err != nil {
         log.Printf("[RequestID: %s] Payment processing failed: %v", requestID, err)
         sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Payment processing failed: %v", err))
@@ -221,15 +143,17 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
 
-    if err := h.createAccountsAndNotify(checkout, &req); err != nil {
+    // Create user accounts and send emails
+    if err := h.createAccountsAndNotify(checkout, &req, resp.TransactionID); err != nil {
         log.Printf("[RequestID: %s] Failed to create account: %v", requestID, err)
         sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to create account: %v", err))
         return
     }
 
-    log.Printf("[RequestID: %s] Payment processed successfully for checkout ID: %s", requestID, req.CheckoutID)
+    // Enqueue background tasks for void transaction and subscription creation
+    h.enqueueBackgroundTasks(requestID, &req, resp.TransactionID)
 
-    defer h.db.ReleaseLock(req.CheckoutID)
+    log.Printf("[RequestID: %s] Payment processed successfully for checkout ID: %s", requestID, req.CheckoutID)
 
     sendSuccessResponse(w, models.APIResponse{
         Status:  "success",
@@ -242,149 +166,35 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     })
 }
 
-func (h *PaymentHandler) ResetCheckoutStatus(w http.ResponseWriter, r *http.Request) {
-    requestID := generateShortID("RST", 10)
-    log.Printf("[RequestID: %s] Resetting checkout status", requestID)
-
-    var req struct {
-        CheckoutID string `json:"sid"`
-    }
-
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-        log.Printf("[RequestID: %s] Invalid request body: %v", requestID, err)
-        sendErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
-        return;
-    }
-
-    if req.CheckoutID == "" {
-        log.Printf("[RequestID: %s] Checkout ID is required", requestID)
-        sendErrorResponse(w, http.StatusBadRequest, "Checkout ID is required")
-        return;
-    }
-
-    log.Printf("[RequestID: %s] Resetting checkout status for ID: %s", requestID, req.CheckoutID)
-
-    query := `UPDATE checkout_historics SET status = 'pending' WHERE checkout_id = ? AND status = 'processing'`
+func (h *PaymentHandler) enqueueBackgroundTasks(requestID string, payment *models.PaymentRequest, transactionID string) {
+    // Enqueue transaction void job
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
     
-    result, err := h.db.GetDB().Exec(query, req.CheckoutID)
-    if err != nil {
-        log.Printf("[RequestID: %s] Error resetting checkout status: %v", requestID, err)
-        sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-        return;
-    }
-
-    rowsAffected, err := result.RowsAffected()
-    if err != nil {
-        log.Printf("[RequestID: %s] Error getting rows affected: %v", requestID, err)
-        sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-        return;
-    }
-
-    h.db.ReleaseLock(req.CheckoutID)
-
-    log.Printf("[RequestID: %s] Successfully reset checkout status for ID: %s. Rows affected: %d", requestID, req.CheckoutID, rowsAffected)
-
-    sendSuccessResponse(w, models.APIResponse{
-        Status:  "success",
-        Message: "Checkout status reset successfully",
-        Data: map[string]interface{}{
-            "checkout_id": req.CheckoutID,
-            "reset": rowsAffected > 0,
-        },
+    voidErr := h.queue.Enqueue(ctx, queue.JobTypeVoidTransaction, map[string]interface{}{
+        "transaction_id": transactionID,
+        "checkout_id":    payment.CheckoutID,
     })
+    
+    if voidErr != nil {
+        log.Printf("[RequestID: %s] Error enqueueing void transaction job: %v", requestID, voidErr)
+    }
+    
+    // Enqueue subscription creation job
+    subscriptionErr := h.queue.Enqueue(ctx, queue.JobTypeCreateSubscription, map[string]interface{}{
+        "checkout_id": payment.CheckoutID,
+        "card_name":   payment.CardName,
+        "card_number": payment.CardNumber,
+        "expiry":      payment.Expiry,
+        "cvv":         payment.CVV,
+    })
+    
+    if subscriptionErr != nil {
+        log.Printf("[RequestID: %s] Error enqueueing subscription creation job: %v", requestID, subscriptionErr)
+    }
 }
 
-func (h *PaymentHandler) UpdateCheckoutID(w http.ResponseWriter, r *http.Request) {
-	requestID := generateShortID("UPD", 10)
-	log.Printf("[RequestID: %s] Updating checkout ID", requestID)
-
-	var req struct {
-		OldCheckoutID string `json:"old_checkout_id"`
-		NewCheckoutID string `json:"new_checkout_id"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		log.Printf("[RequestID: %s] Invalid request body: %v", requestID, err)
-		sendErrorResponse(w, http.StatusBadRequest, fmt.Sprintf("Invalid request body: %v", err))
-		return
-	}
-
-	if req.OldCheckoutID == "" || req.NewCheckoutID == "" {
-		log.Printf("[RequestID: %s] Both old and new checkout IDs are required", requestID)
-		sendErrorResponse(w, http.StatusBadRequest, "Both old and new checkout IDs are required")
-		return
-	}
-
-	log.Printf("[RequestID: %s] Updating checkout ID from %s to %s", requestID, req.OldCheckoutID, req.NewCheckoutID)
-
-	// First, check if the old checkout ID exists
-	exists, err := h.checkIfCheckoutExists(req.OldCheckoutID)
-	if err != nil {
-		log.Printf("[RequestID: %s] Error checking if checkout exists: %v", requestID, err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-		return
-	}
-
-	if !exists {
-		log.Printf("[RequestID: %s] Old checkout ID not found: %s", requestID, req.OldCheckoutID)
-		sendErrorResponse(w, http.StatusNotFound, "Old checkout ID not found")
-		return
-	}
-
-	// Update the checkout ID in the checkout_historics table
-	query := `UPDATE checkout_historics SET checkout_id = ? WHERE checkout_id = ?`
-
-	result, err := h.db.GetDB().Exec(query, req.NewCheckoutID, req.OldCheckoutID)
-	if err != nil {
-		log.Printf("[RequestID: %s] Error updating checkout ID: %v", requestID, err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-		return
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		log.Printf("[RequestID: %s] Error getting rows affected: %v", requestID, err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
-		return
-	}
-
-	if rowsAffected == 0 {
-		log.Printf("[RequestID: %s] No rows updated for checkout ID: %s", requestID, req.OldCheckoutID)
-		sendErrorResponse(w, http.StatusNotFound, "Checkout record not found")
-		return
-	}
-
-	log.Printf("[RequestID: %s] Successfully updated checkout ID from %s to %s. Rows affected: %d", requestID, req.OldCheckoutID, req.NewCheckoutID, rowsAffected)
-
-	// Make sure any locks on the old checkout ID are released
-	h.db.ReleaseLock(req.OldCheckoutID)
-
-	sendSuccessResponse(w, models.APIResponse{
-		Status:  "success",
-		Message: "Checkout ID updated successfully",
-		Data: map[string]interface{}{
-			"old_checkout_id": req.OldCheckoutID,
-			"new_checkout_id": req.NewCheckoutID,
-			"updated":         rowsAffected > 0,
-		},
-	})
-}
-
-// checkIfCheckoutExists checks if a checkout record exists with the given ID
-func (h *PaymentHandler) checkIfCheckoutExists(checkoutID string) (bool, error) {
-	query := `SELECT COUNT(*) FROM checkout_historics WHERE checkout_id = ?`
-	
-	var count int
-	err := h.db.GetDB().QueryRow(query, checkoutID).Scan(&count)
-	if err != nil {
-		return false, err
-	}
-	
-	return count > 0, nil
-}
-
-
-func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, payment *models.PaymentRequest) error {
+func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, payment *models.PaymentRequest, transactionID string) error {
     tx, err := h.db.BeginTransaction()
     if err != nil {
         return fmt.Errorf("failed to begin transaction: %v", err)
@@ -484,12 +294,12 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         return fmt.Errorf("failed to create future invoice: %v", err)
     }
 
-    if err := tx.SaveTransaction(masterUUID, checkout.ID, 1.00, "authorized", "INIT_AUTH"); err != nil {
+    if err := tx.SaveTransaction(masterUUID, checkout.ID, 1.00, "authorized", transactionID); err != nil {
         tx.Rollback()
         return fmt.Errorf("failed to save transaction: %v", err)
     }
 
-    if err := tx.SaveSubscription(masterUUID, "active", futureDate); err != nil {
+    if err := tx.SaveSubscription(masterUUID, "pending", futureDate); err != nil {
         tx.Rollback()
         return fmt.Errorf("failed to save subscription: %v", err)
     }
@@ -498,6 +308,8 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         return fmt.Errorf("failed to commit transaction: %v", err)
     }
 
+    // Generate activation code and send emails in the main thread
+    // We still want these to happen immediately after payment authorization
     code := utils.GenerateActivationCode()
     encodedUser := base64.StdEncoding.EncodeToString([]byte(checkout.Username))
     encodedEmail := base64.StdEncoding.EncodeToString([]byte(checkout.Email))
@@ -505,7 +317,6 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
 
     if err := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code); err != nil {
         log.Printf("Warning: Failed to update activation code: %v", err)
-
     }
 
     activationURL := fmt.Sprintf(
@@ -538,8 +349,8 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
 func (h *PaymentHandler) generateActivationEmail(username, activationURL string) string {
     content := fmt.Sprintf(
         "In order to activate your account, we need to confirm your email address. Once we do, "+
-        "you will be able to log into your Administrator Portal and begin setting up your devices "+
-        "on the most advanced security service on the planet.",
+            "you will be able to log into your Administrator Portal and begin setting up your devices "+
+            "on the most advanced security service on the planet.",
     )
     
     footer := "Thank you so much,\nThe ProSecureLSP Team"

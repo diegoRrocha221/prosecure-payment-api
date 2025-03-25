@@ -1,10 +1,10 @@
 package payment
 
 import (
-    "time"
     "errors"
     "fmt"
     "log"
+    "time"
     "prosecure-payment-api/models"
     "prosecure-payment-api/services/payment/authorizenet"
 )
@@ -20,6 +20,34 @@ func NewPaymentService(apiLoginID, transactionKey, merchantID, environment strin
     }
 }
 
+// ProcessInitialAuthorization only performs the initial $1 authorization without void or subscription
+func (s *Service) ProcessInitialAuthorization(payment *models.PaymentRequest) (*models.TransactionResponse, error) {
+    log.Printf("Starting initial payment authorization for checkout ID: %s", payment.CheckoutID)
+
+    if !s.ValidateCard(payment) {
+        return nil, errors.New("invalid card data: please check card number, expiration date and CVV")
+    }
+
+    // Process initial charge
+    resp, err := s.client.ProcessPayment(payment)
+    if err != nil {
+        log.Printf("Error processing payment: %v", err)
+        return nil, fmt.Errorf("payment processing failed: %v", err)
+    }
+
+    if !resp.Success {
+        log.Printf("Payment authorization unsuccessful: %s", resp.Message)
+        return resp, nil
+    }
+
+    log.Printf("Initial payment authorization successful for checkout ID: %s with transaction ID: %s", 
+        payment.CheckoutID, resp.TransactionID)
+    
+    return resp, nil
+}
+
+// ProcessPayment performs the complete payment flow (authorization, void, and subscription)
+// This is the original method kept for compatibility
 func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *models.CheckoutData) (*models.TransactionResponse, error) {
     log.Printf("Starting payment processing for checkout ID: %s", payment.CheckoutID)
 
@@ -39,18 +67,18 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
         return resp, nil
     }
 
-    // Void the transaction - this is critical
+    // Void the transaction
     log.Printf("Payment successful, voiding transaction: %s", resp.TransactionID)
     if err := s.client.VoidTransaction(resp.TransactionID); err != nil {
         log.Printf("Error voiding transaction: %v", err)
         return nil, fmt.Errorf("failed to void initial transaction: %v", err)
     }
 
-    // Setup recurring billing - this is also critical
+    // Setup recurring billing
     log.Printf("Setting up recurring billing for checkout ID: %s", payment.CheckoutID)
     if err := s.SetupRecurringBilling(payment, checkout); err != nil {
         log.Printf("Error setting up recurring billing: %v", err)
-        // Tenta fazer void da transação original para garantir que não fique pendurada
+        // Try to void the transaction again to ensure it's not hanging
         if voidErr := s.client.VoidTransaction(resp.TransactionID); voidErr != nil {
             log.Printf("Error voiding transaction after recurring billing failure: %v", voidErr)
         }
@@ -58,6 +86,12 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
     }
 
     return resp, nil
+}
+
+// VoidTransaction voids a previously authorized transaction
+func (s *Service) VoidTransaction(transactionID string) error {
+    log.Printf("Voiding transaction: %s", transactionID)
+    return s.client.VoidTransaction(transactionID)
 }
 
 func (s *Service) ValidateCard(payment *models.PaymentRequest) bool {
@@ -94,7 +128,7 @@ func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout
         return errors.New("invalid card data for recurring billing setup")
     }
 
-    // CreateSubscription irá retornar erro se a operação falhar
+    // CreateSubscription will return error if the operation fails
     subscription, err := s.client.CreateSubscription(payment, checkout)
     if err != nil {
         return fmt.Errorf("failed to setup recurring billing: %v", err)

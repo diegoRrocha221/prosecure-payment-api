@@ -2,7 +2,6 @@ package main
 
 import (
     "context"
-    "encoding/gob"
     "encoding/json"
     "fmt"
     "log"
@@ -18,19 +17,17 @@ import (
     "prosecure-payment-api/config"
     "prosecure-payment-api/database"
     "prosecure-payment-api/handlers"
-    "prosecure-payment-api/models"
-    "prosecure-payment-api/services/payment"
+    "prosecure-payment-api/queue"
     "prosecure-payment-api/services/email"
+    "prosecure-payment-api/services/payment"
+    "prosecure-payment-api/worker"
 )
-/*
+
 func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        // Permite qualquer origem
         w.Header().Set("Access-Control-Allow-Origin", "*")
-        w.Header().Set("Access-Control-Allow-Methods", "*")
-        w.Header().Set("Access-Control-Allow-Headers", "*")
-        w.Header().Set("Access-Control-Allow-Credentials", "true")
-        
+        w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization, h-captcha-response")
         if r.Method == "OPTIONS" {
             w.WriteHeader(http.StatusOK)
             return
@@ -38,43 +35,7 @@ func corsMiddleware(next http.Handler) http.Handler {
         next.ServeHTTP(w, r)
     })
 }
-*/
-func corsMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        origin := r.Header.Get("Origin")
-        allowedOrigins := map[string]bool{
-            "https://prosecurelsp.com":     true,
-            "https://www.prosecurelsp.com": true,
-        }
 
-        if allowedOrigins[origin] {
-            w.Header().Set("Access-Control-Allow-Origin", origin)
-            w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-            w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
-            w.Header().Set("Access-Control-Allow-Credentials", "true")
-            w.Header().Set("Access-Control-Max-Age", "86400")
-        }
-
-        if r.Method == "OPTIONS" {
-            w.WriteHeader(http.StatusOK)
-            return
-        }
-
-        next.ServeHTTP(w, r)
-    })
-}
-
-func recoveryMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        defer func() {
-            if err := recover(); err != nil {
-                log.Printf("Panic recovered: %v", err)
-                http.Error(w, "Internal server error", http.StatusInternalServerError)
-            }
-        }()
-        next.ServeHTTP(w, r)
-    })
-}
 type responseWriter struct {
     http.ResponseWriter
     status int
@@ -106,10 +67,10 @@ func loggingMiddleware(next http.Handler) http.Handler {
 func main() {
     log.SetFlags(log.LstdFlags | log.Lshortfile | log.LUTC)
 
-    gob.Register([]models.CartItem{})
     cfg := config.Load()
     log.Printf("Starting server with configuration: %+v", cfg)
 
+    // Connect to database
     var db *database.Connection
     var err error
     for retries := 0; retries < 3; retries++ {
@@ -133,7 +94,7 @@ func main() {
     }
     log.Println("Successfully connected to database")
 
-
+    // Initialize payment and email services
     paymentService := payment.NewPaymentService(
         cfg.AuthNet.APILoginID,
         cfg.AuthNet.TransactionKey,
@@ -142,10 +103,24 @@ func main() {
     )
     emailService := email.NewSMTPService(cfg.SMTP)
 
+    // Initialize Redis queue
+    jobQueue, err := queue.NewQueue(cfg.Redis.URL, "payment_jobs")
+    if err != nil {
+        log.Fatalf("Failed to connect to Redis: %v", err)
+    }
+    defer jobQueue.Close()
+    log.Println("Successfully connected to Redis")
 
+    // Start the worker
+    paymentWorker := worker.NewWorker(jobQueue, db, paymentService)
+    paymentWorker.Start(cfg.Redis.WorkerConcurrency)
+    defer paymentWorker.Stop()
+    log.Printf("Started payment worker with %d threads", cfg.Redis.WorkerConcurrency)
+
+    // Initialize payment handler
     var paymentHandler *handlers.PaymentHandler
     for retries := 0; retries < 3; retries++ {
-        paymentHandler, err = handlers.NewPaymentHandler(db, paymentService, emailService)
+        paymentHandler, err = handlers.NewPaymentHandler(db, paymentService, emailService, jobQueue)
         if err == nil {
             break
         }
@@ -156,10 +131,11 @@ func main() {
         log.Fatalf("Failed to initialize payment handler after retries: %v", err)
     }
 
+    // Set up router
     router := mux.NewRouter()
-    router.Use(recoveryMiddleware)
     router.Use(corsMiddleware)
     router.Use(loggingMiddleware)
+
     planHandler := handlers.NewPlanHandler(db)
     cartHandler := handlers.NewCartHandler(db, cfg)
     checkoutHandler := handlers.NewCheckoutHandler(db)
@@ -179,22 +155,31 @@ func main() {
     api.HandleFunc("/cart", cartHandler.UpdateCart).Methods("PUT", "OPTIONS")
     api.HandleFunc("/cart", cartHandler.GetCart).Methods("GET", "OPTIONS")
     api.HandleFunc("/cart/remove", cartHandler.RemoveFromCart).Methods("POST", "OPTIONS")
-    //api.HandleFunc("/3ds/callback", paymentHandler.Handle3DSCallback).Methods("POST", "OPTIONS")
 
     api.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
         health := struct {
             Status    string    `json:"status"`
             Time     string    `json:"time"`
             Database string    `json:"database"`
+            Redis    string    `json:"redis"`
         }{
             Status:    "ok",
             Time:     time.Now().Format(time.RFC3339),
             Database: "connected",
+            Redis:    "connected",
         }
 
         if err := db.Ping(); err != nil {
             health.Status = "degraded"
             health.Database = "error"
+        }
+
+        ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+        defer cancel()
+        
+        if err := jobQueue.Client().Ping(ctx).Err(); err != nil {
+            health.Status = "degraded"
+            health.Redis = "error"
         }
 
         w.Header().Set("Content-Type", "application/json")
@@ -209,6 +194,7 @@ func main() {
         IdleTimeout:  60 * time.Second,
     }
 
+    // Start server in a goroutine so we can handle shutdown gracefully
     stop := make(chan os.Signal, 1)
     signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
@@ -225,9 +211,14 @@ func main() {
     ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
     defer cancel()
 
+    // First shutdown the HTTP server
     if err := srv.Shutdown(ctx); err != nil {
         log.Printf("Server forced to shutdown: %v", err)
     }
+
+    // Then stop the worker
+    paymentWorker.Stop()
+    log.Println("Payment worker stopped")
 
     log.Println("Server exited properly")
 }
