@@ -165,38 +165,141 @@ func (w *Worker) processVoidTransaction(job *queue.Job) error {
 func (w *Worker) processCreateSubscription(job *queue.Job) error {
 	log.Printf("Processing subscription creation job %s", job.ID)
 	
-	// Extrair dados do job
+	// Extrair dados do job com verificações de tipo
 	checkoutID, ok := job.Data["checkout_id"].(string)
 	if !ok || checkoutID == "" {
-			return fmt.Errorf("invalid checkout_id in job data")
+		return fmt.Errorf("invalid checkout_id in job data")
 	}
 	
 	// Obter dados do checkout
 	checkout, err := w.db.GetCheckoutData(checkoutID)
 	if err != nil {
-			return fmt.Errorf("failed to get checkout data: %v", err)
+		return fmt.Errorf("failed to get checkout data: %v", err)
 	}
 	
-	// Criar objeto de requisição de pagamento com dados do job
+	// Extrair os dados do cartão com verificações de segurança
+	var cardName, cardNumber, expiry, cvv, email string
+	
+	// Verificar cada campo individualmente com fallbacks seguros
+	if cardNameVal, ok := job.Data["card_name"]; ok && cardNameVal != nil {
+		if cardNameStr, ok := cardNameVal.(string); ok {
+			cardName = cardNameStr
+		}
+	}
+	
+	if cardNumberVal, ok := job.Data["card_number"]; ok && cardNumberVal != nil {
+		if cardNumberStr, ok := cardNumberVal.(string); ok {
+			cardNumber = cardNumberStr
+		}
+	}
+	
+	if expiryVal, ok := job.Data["expiry"]; ok && expiryVal != nil {
+		if expiryStr, ok := expiryVal.(string); ok {
+			expiry = expiryStr
+		}
+	}
+	
+	if cvvVal, ok := job.Data["cvv"]; ok && cvvVal != nil {
+		if cvvStr, ok := cvvVal.(string); ok {
+			cvv = cvvStr
+		}
+	}
+	
+	if emailVal, ok := job.Data["email"]; ok && emailVal != nil {
+		if emailStr, ok := emailVal.(string); ok {
+			email = emailStr
+		} else {
+			// Se não conseguir extrair o email do job, use o do checkout
+			email = checkout.Email
+		}
+	} else {
+		// Fallback para o email do checkout
+		email = checkout.Email
+	}
+	
+	// Verificar se temos todos os dados necessários
+	if cardName == "" || cardNumber == "" || expiry == "" || cvv == "" {
+		log.Printf("Missing card information in job data. Attempting to retrieve from database.")
+		
+		// Verificar se a tabela existe
+		var tableExists int
+		tableCheckCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		// Esta consulta funciona em MySQL/MariaDB
+		err := w.db.GetDB().QueryRowContext(tableCheckCtx, 
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = 'temp_payment_data'").Scan(&tableExists)
+		
+		if err != nil || tableExists == 0 {
+			log.Printf("Error checking temp_payment_data table existence: %v", err)
+			
+			// Tentar criar a tabela
+			_, err = w.db.GetDB().ExecContext(tableCheckCtx, `
+				CREATE TABLE IF NOT EXISTS temp_payment_data (
+					checkout_id VARCHAR(36) PRIMARY KEY,
+					card_number VARCHAR(19) NOT NULL,
+					card_expiry VARCHAR(5) NOT NULL,
+					card_cvv VARCHAR(4) NOT NULL,
+					card_name VARCHAR(255) NOT NULL,
+					created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+				)
+			`)
+			
+			if err != nil {
+				log.Printf("Failed to create temp_payment_data table: %v", err)
+				return fmt.Errorf("insufficient payment data and could not create table: %v", err)
+			}
+			
+			log.Printf("Created temp_payment_data table")
+			return fmt.Errorf("insufficient payment data and temp_payment_data table was just created - please try again")
+		}
+		
+		// A tabela existe, tentar recuperar os dados
+		dataCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		var tempCardName, tempCardNumber, tempExpiry, tempCVV string
+		err = w.db.GetDB().QueryRowContext(dataCtx, 
+			"SELECT card_name, card_number, card_expiry, card_cvv FROM temp_payment_data WHERE checkout_id = ?", 
+			checkoutID).Scan(&tempCardName, &tempCardNumber, &tempExpiry, &tempCVV)
+		
+		if err != nil {
+			log.Printf("Error retrieving payment data from temp_payment_data: %v", err)
+			return fmt.Errorf("failed to retrieve payment data from database: %v", err)
+		}
+		
+		// Usar os dados recuperados
+		cardName = tempCardName
+		cardNumber = tempCardNumber
+		expiry = tempExpiry
+		cvv = tempCVV
+	}
+	
+	// Verificar se ainda temos dados insuficientes
+	if cardName == "" || cardNumber == "" || expiry == "" || cvv == "" {
+		return fmt.Errorf("insufficient payment data for subscription creation. Fields missing: %s%s%s%s", 
+			cardName == "" ? "cardName " : "", 
+			cardNumber == "" ? "cardNumber " : "", 
+			expiry == "" ? "expiry " : "", 
+			cvv == "" ? "cvv" : "")
+	}
+	
+	// Criar objeto de requisição de pagamento com os dados obtidos
 	paymentRequest := &models.PaymentRequest{
-			CardName:    job.Data["card_name"].(string),
-			CardNumber:  job.Data["card_number"].(string),
-			Expiry:      job.Data["expiry"].(string),
-			CVV:         job.Data["cvv"].(string),
-			CheckoutID:  checkoutID,
-			CustomerEmail: job.Data["email"].(string),
+		CardName:      cardName,
+		CardNumber:    cardNumber,
+		Expiry:        expiry,
+		CVV:           cvv,
+		CheckoutID:    checkoutID,
+		CustomerEmail: email,
 	}
 	
 	log.Printf("Setting up subscription for checkout %s", checkoutID)
 	
 	// Configurar a assinatura recorrente
-	subscriptionResp, err := w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
+	err = w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
 	if err != nil {
-			return fmt.Errorf("failed to setup recurring billing: %v", err)
-	}
-	
-	if !subscriptionResp.Success {
-			return fmt.Errorf("subscription setup failed: %s", subscriptionResp.Message)
+		return fmt.Errorf("failed to setup recurring billing: %v", err)
 	}
 	
 	// Atualizar o status da assinatura no banco de dados
@@ -206,24 +309,23 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 	// Buscar o master_reference associado ao checkout
 	var masterRef string
 	err = w.db.GetDB().QueryRowContext(ctx, 
-			"SELECT master_reference FROM transactions WHERE checkout_id = ? LIMIT 1", 
-			checkoutID).Scan(&masterRef)
+		"SELECT master_reference FROM transactions WHERE checkout_id = ? LIMIT 1", 
+		checkoutID).Scan(&masterRef)
 	
 	if err != nil {
-			return fmt.Errorf("failed to get master reference: %v", err)
+		return fmt.Errorf("failed to get master reference: %v", err)
 	}
 	
 	// Atualizar a assinatura com o ID da assinatura da Authorize.net
 	_, err = w.db.GetDB().ExecContext(ctx, 
-			"UPDATE subscriptions SET subscription_id = ?, status = 'active' WHERE master_reference = ?", 
-			subscriptionResp.SubscriptionID, masterRef)
+		"UPDATE subscriptions SET status = 'active' WHERE master_reference = ?", 
+		masterRef)
 	
 	if err != nil {
-			return fmt.Errorf("failed to update subscription with ARB ID: %v", err)
+		return fmt.Errorf("failed to update subscription status: %v", err)
 	}
 	
-	log.Printf("Successfully set up subscription for checkout %s with subscription ID %s", 
-			checkoutID, subscriptionResp.SubscriptionID)
+	log.Printf("Successfully set up subscription for checkout %s", checkoutID)
 	
 	return nil
 }

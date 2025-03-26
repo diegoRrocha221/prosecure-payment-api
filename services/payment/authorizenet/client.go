@@ -8,14 +8,15 @@ import (
     "log"
     "net/http"
     "strings"
-    "prosecure-payment-api/models"
     "time"
+    
+    "prosecure-payment-api/models"
 )
 
 const (
     SandboxEndpoint = "https://apitest.authorize.net/xml/v1/request.api"
     ProductionEndpoint = "https://api.authorize.net/xml/v1/request.api"
-    DuplicateWindow = 120 // Janela de duplicação em segundos (2 minutos)
+    DuplicateWindow = 3
 )
 
 type Client struct {
@@ -51,8 +52,10 @@ func (c *Client) getMerchantAuthentication() merchantAuthenticationType {
 }
 
 func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.TransactionResponse, error) {
-    // Criar um ID de pedido único para evitar duplicações
     orderID := fmt.Sprintf("Order-%s-%d", req.CheckoutID, time.Now().UnixNano())
+    if len(orderID) > 20 {
+        orderID = fmt.Sprintf("Order-%d", time.Now().UnixNano() % 100000)
+    }
     
     // Construir a solicitação básica
     txRequest := transactionRequestType{
@@ -70,8 +73,15 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
             InvoiceNumber: orderID,
             Description:   "ProSecure Validation Charge",
         },
-        // Adicionar configuração de janela de duplicação
-        DuplicateWindow: DuplicateWindow,
+        // Adicionar configurações de transação, incluindo a janela de duplicação
+        TransactionSettings: &TransactionSettingsType{
+            Settings: []SettingType{
+                {
+                    SettingName:  "duplicateWindow",
+                    SettingValue: fmt.Sprintf("%d", DuplicateWindow),
+                },
+            },
+        },
     }
     
     // Adicionar informações do cliente se disponíveis
@@ -87,11 +97,14 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
         txRequest.BillTo = req.BillingInfo
     }
     
-    // Construir a solicitação completa
+    refId := req.CheckoutID
+        if len(refId) > 20 {
+        refId = refId[:19]
+    }
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
-            RefID: req.CheckoutID,
+            RefID: refId,  // Use a variável refId em vez de req.CheckoutID
             TransactionRequest: txRequest,
         },
     }

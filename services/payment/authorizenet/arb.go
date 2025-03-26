@@ -8,8 +8,9 @@ import (
     "log"
     "net/http"
     "strings"
-    "prosecure-payment-api/models"
     "time"
+    
+    "prosecure-payment-api/models"
 )
 
 func formatPhoneNumber(phone string) string {

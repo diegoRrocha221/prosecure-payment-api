@@ -264,7 +264,7 @@ func (h *WebhookHandler) processSubscriptionNotification(subscriptionID, eventTy
 // Função para armazenar temporariamente os dados do cartão de forma segura
 // Nota: Em produção, considere usar criptografia ou tokenização
 func (h *WebhookHandler) StoreTemporaryPaymentData(w http.ResponseWriter, r *http.Request) {
-	var req models.PaymentDataStorage
+	// Removendo variável não utilizada
 	if err := r.ParseForm(); err != nil {
 		log.Printf("Error parsing payment storage form: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, "Invalid request format")

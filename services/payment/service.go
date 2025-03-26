@@ -129,16 +129,16 @@ func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout
     }
 
     // CreateSubscription will return error if the operation fails
-    subscription, err := s.client.CreateSubscription(payment, checkout)
+    subscriptionResp, err := s.client.CreateSubscription(payment, checkout)
     if err != nil {
         return fmt.Errorf("failed to setup recurring billing: %v", err)
     }
 
-    if subscription == nil || subscription.SubscriptionID == "" {
-        return errors.New("subscription creation failed: no subscription ID returned")
+    if !subscriptionResp.Success {
+        return fmt.Errorf("subscription creation failed: %s", subscriptionResp.Message)
     }
 
-    log.Printf("Successfully created subscription with ID: %s", subscription.SubscriptionID)
+    log.Printf("Successfully created subscription with ID: %s", subscriptionResp.SubscriptionID)
     return nil
 }
 

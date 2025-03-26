@@ -16,6 +16,7 @@ import (
     "prosecure-payment-api/database"
     "prosecure-payment-api/utils"
     "prosecure-payment-api/queue"
+    "prosecure-payment-api/types" // Importar o novo pacote types
 )
 
 type PaymentHandler struct {
@@ -67,12 +68,6 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     requestID := uuid.New().String()
     log.Printf("[RequestID: %s] Starting payment processing", requestID)
 
-    captchaToken := r.Header.Get("h-captcha-response")
-    if err := validateHCaptcha(captchaToken); err != nil {
-        log.Printf("[RequestID: %s] Captcha validation failed: %v", requestID, err)
-        sendErrorResponse(w, http.StatusBadRequest, "Security verification failed. Please try again.")
-        return
-    }
 
     var req models.PaymentRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -123,7 +118,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
 
     // Preencher informações adicionais do cliente para evitar duplicações e melhorar taxas de aprovação
     req.CustomerEmail = checkout.Email
-    req.BillingInfo = &authorizenet.BillingInfoType{
+    req.BillingInfo = &types.BillingInfoType{ // Usar tipo do pacote types
         FirstName:   strings.Split(checkout.Name, " ")[0],
         LastName:    strings.Join(strings.Split(checkout.Name, " ")[1:], " "),
         Address:     checkout.Street,
@@ -210,177 +205,6 @@ func (h *PaymentHandler) enqueueBackgroundTasks(requestID string, payment *model
     if subscriptionErr != nil {
         log.Printf("[RequestID: %s] Error enqueueing subscription creation job: %v", requestID, subscriptionErr)
     }
-}
-
-func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, payment *models.PaymentRequest, transactionID string) error {
-    tx, err := h.db.BeginTransaction()
-    if err != nil {
-        return fmt.Errorf("failed to begin transaction: %v", err)
-    }
-
-    masterUUID := uuid.New().String()
-    log.Printf("Generated master UUID: %s", masterUUID)
-
-    names := strings.Fields(checkout.Name)
-    firstName := names[0]
-    lastName := strings.Join(names[1:], " ")
-
-    masterAccount := &models.MasterAccount{
-        Name:             firstName,
-        LastName:         lastName,
-        ReferenceUUID:    masterUUID,
-        Email:            checkout.Email,
-        Username:         checkout.Username,
-        PhoneNumber:      checkout.PhoneNumber,
-        IsAnnually:      0,
-        IsTrial:         1,
-        State:           checkout.State,
-        City:            checkout.City,
-        Street:          checkout.Street,
-        ZipCode:         checkout.ZipCode,
-        AdditionalInfo:  checkout.Additional,
-        Plan:            checkout.PlanID,
-        PurchasedPlans:  checkout.PlansJSON,
-        SimultaneousUsers: len(checkout.Plans),
-        RenewDate:       time.Now().AddDate(0, 1, 0),
-    }
-
-    var total float64
-    for _, plan := range checkout.Plans {
-        if plan.Annually == 1 {
-            masterAccount.IsAnnually = 1
-            total += plan.Price * 10 
-        } else {
-            total += plan.Price
-        }
-    }
-    masterAccount.TotalPrice = total
-
-    if err := tx.SaveMasterAccount(masterAccount); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to create master account: %v", err)
-    }
-
-    user := &models.User{
-        MasterReference: masterUUID,
-        Username:        checkout.Username,
-        Email:          checkout.Email,
-        Passphrase:     checkout.Passphrase,
-        IsMaster:       1,
-        PlanID:         checkout.Plans[0].PlanID,
-    }
-
-    if err := tx.SaveUser(user); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to create user: %v", err)
-    }
-
-    cardData := &models.CardData{
-        Number: payment.CardNumber,
-        Expiry: payment.Expiry,
-    }
-
-    if err := tx.SavePaymentMethod(masterUUID, cardData); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to save payment method: %v", err)
-    }
-
-    trialInvoice := &models.Invoice{
-        MasterReference: masterUUID,
-        IsTrial:        1,
-        Total:          0,
-        DueDate:        time.Now(),
-        IsPaid:         1,
-    }
-
-    if err := tx.SaveInvoice(trialInvoice); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to create trial invoice: %v", err)
-    }
-
-    futureDate := time.Now().AddDate(0, 1, 0)
-    futureInvoice := &models.Invoice{
-        MasterReference: masterUUID,
-        IsTrial:        0,
-        Total:          total,
-        DueDate:        futureDate,
-        IsPaid:         0,
-    }
-
-    if err := tx.SaveInvoice(futureInvoice); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to create future invoice: %v", err)
-    }
-
-    if err := tx.SaveTransaction(masterUUID, checkout.ID, 1.00, "authorized", transactionID); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to save transaction: %v", err)
-    }
-
-    // Inicialmente, salvar com subscription_id vazio, será atualizado pelo worker
-    if err := tx.SaveSubscription(masterUUID, "pending", futureDate, ""); err != nil {
-        tx.Rollback()
-        return fmt.Errorf("failed to save subscription: %v", err)
-    }
-
-    if err := tx.Commit(); err != nil {
-        return fmt.Errorf("failed to commit transaction: %v", err)
-    }
-
-    // Armazenar temporariamente os dados do cartão para uso pelo webhook
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    
-    _, err = h.db.GetDB().ExecContext(ctx,
-        `INSERT INTO temp_payment_data
-         (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
-         VALUES (?, ?, ?, ?, ?, NOW())
-         ON DUPLICATE KEY UPDATE
-         card_number = VALUES(card_number),
-         card_expiry = VALUES(card_expiry),
-         card_cvv = VALUES(card_cvv),
-         card_name = VALUES(card_name),
-         created_at = NOW()`,
-        checkout.ID, payment.CardNumber, payment.Expiry, payment.CVV, payment.CardName)
-    
-    if err != nil {
-        log.Printf("Warning: Failed to store temporary payment data: %v", err)
-    }
-
-    code := utils.GenerateActivationCode()
-    encodedUser := base64.StdEncoding.EncodeToString([]byte(checkout.Username))
-    encodedEmail := base64.StdEncoding.EncodeToString([]byte(checkout.Email))
-    encodedCode := base64.StdEncoding.EncodeToString([]byte(code))
-
-    if err := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code); err != nil {
-        log.Printf("Warning: Failed to update activation code: %v", err)
-    }
-
-    activationURL := fmt.Sprintf(
-        "https://prosecurelsp.com/users/active/activation.php?act=%s&emp=%s&cct=%s",
-        encodedUser, encodedEmail, encodedCode,
-    )
-
-    activationEmailContent := h.generateActivationEmail(checkout.Username, activationURL)
-    if err := h.emailService.SendEmail(
-        checkout.Email,
-        "Please Confirm Your Email Address",
-        activationEmailContent,
-    ); err != nil {
-        log.Printf("Warning: Failed to send activation email: %v", err)
-    }
-
-    invoiceEmailContent := h.generateInvoiceEmail(checkout)
-    if err := h.emailService.SendEmail(
-        checkout.Email,
-        "Your invoice has been delivered :)",
-        invoiceEmailContent,
-    ); err != nil {
-        log.Printf("Warning: Failed to send invoice email: %v", err)
-    }
-
-    log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
-    return nil
 }
 
 // ResetCheckoutStatus resets a checkout's status
@@ -553,3 +377,173 @@ func (h *PaymentHandler) generateInvoiceEmail(checkout *models.CheckoutData) str
         footer,
     )
 }
+
+func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, payment *models.PaymentRequest, transactionID string) error {
+    tx, err := h.db.BeginTransaction()
+    if err != nil {
+        return fmt.Errorf("failed to begin transaction: %v", err)
+    }
+
+    masterUUID := uuid.New().String()
+    log.Printf("Generated master UUID: %s", masterUUID)
+
+    names := strings.Fields(checkout.Name)
+    firstName := names[0]
+    lastName := strings.Join(names[1:], " ")
+
+    masterAccount := &models.MasterAccount{
+        Name:             firstName,
+        LastName:         lastName,
+        ReferenceUUID:    masterUUID,
+        Email:            checkout.Email,
+        Username:         checkout.Username,
+        PhoneNumber:      checkout.PhoneNumber,
+        IsAnnually:      0,
+        IsTrial:         1,
+        State:           checkout.State,
+        City:            checkout.City,
+        Street:          checkout.Street,
+        ZipCode:         checkout.ZipCode,
+        AdditionalInfo:  checkout.Additional,
+        Plan:            checkout.PlanID,
+        PurchasedPlans:  checkout.PlansJSON,
+        SimultaneousUsers: len(checkout.Plans),
+        RenewDate:       time.Now().AddDate(0, 1, 0),
+    }
+
+    var total float64
+    for _, plan := range checkout.Plans {
+        if plan.Annually == 1 {
+            masterAccount.IsAnnually = 1
+            total += plan.Price * 10 
+        } else {
+            total += plan.Price
+        }
+    }
+    masterAccount.TotalPrice = total
+
+    if err := tx.SaveMasterAccount(masterAccount); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to create master account: %v", err)
+    }
+
+    user := &models.User{
+        MasterReference: masterUUID,
+        Username:        checkout.Username,
+        Email:          checkout.Email,
+        Passphrase:     checkout.Passphrase,
+        IsMaster:       1,
+        PlanID:         checkout.Plans[0].PlanID,
+    }
+
+    if err := tx.SaveUser(user); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to create user: %v", err)
+    }
+
+    cardData := &models.CardData{
+        Number: payment.CardNumber,
+        Expiry: payment.Expiry,
+    }
+
+    if err := tx.SavePaymentMethod(masterUUID, cardData); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to save payment method: %v", err)
+    }
+
+    trialInvoice := &models.Invoice{
+        MasterReference: masterUUID,
+        IsTrial:        1,
+        Total:          0,
+        DueDate:        time.Now(),
+        IsPaid:         1,
+    }
+
+    if err := tx.SaveInvoice(trialInvoice); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to create trial invoice: %v", err)
+    }
+
+    futureDate := time.Now().AddDate(0, 1, 0)
+    futureInvoice := &models.Invoice{
+        MasterReference: masterUUID,
+        IsTrial:        0,
+        Total:          total,
+        DueDate:        futureDate,
+        IsPaid:         0,
+    }
+
+    if err := tx.SaveInvoice(futureInvoice); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to create future invoice: %v", err)
+    }
+
+    if err := tx.SaveTransaction(masterUUID, checkout.ID, 1.00, "authorized", transactionID); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to save transaction: %v", err)
+    }
+
+    // Inicialmente, salvar com subscription_id vazio, será atualizado pelo worker
+    if err := tx.SaveSubscription(masterUUID, "pending", futureDate, ""); err != nil {
+        tx.Rollback()
+        return fmt.Errorf("failed to save subscription: %v", err)
+    }
+
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf("failed to commit transaction: %v", err)
+    }
+
+    // Armazenar temporariamente os dados do cartão para uso pelo webhook
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    _, err = h.db.GetDB().ExecContext(ctx,
+        `INSERT INTO temp_payment_data
+         (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
+         VALUES (?, ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE
+         card_number = VALUES(card_number),
+         card_expiry = VALUES(card_expiry),
+         card_cvv = VALUES(card_cvv),
+         card_name = VALUES(card_name),
+         created_at = NOW()`,
+        checkout.ID, payment.CardNumber, payment.Expiry, payment.CVV, payment.CardName)
+    
+    if err != nil {
+        log.Printf("Warning: Failed to store temporary payment data: %v", err)
+    }
+
+    code := utils.GenerateActivationCode()
+    encodedUser := base64.StdEncoding.EncodeToString([]byte(checkout.Username))
+    encodedEmail := base64.StdEncoding.EncodeToString([]byte(checkout.Email))
+    encodedCode := base64.StdEncoding.EncodeToString([]byte(code))
+
+    if err := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code); err != nil {
+        log.Printf("Warning: Failed to update activation code: %v", err)
+    }
+
+    activationURL := fmt.Sprintf(
+        "https://prosecurelsp.com/users/active/activation.php?act=%s&emp=%s&cct=%s",
+        encodedUser, encodedEmail, encodedCode,
+    )
+
+    activationEmailContent := h.generateActivationEmail(checkout.Username, activationURL)
+    if err := h.emailService.SendEmail(
+        checkout.Email,
+        "Please Confirm Your Email Address",
+        activationEmailContent,
+    ); err != nil {
+        log.Printf("Warning: Failed to send activation email: %v", err)
+    }
+
+    invoiceEmailContent := h.generateInvoiceEmail(checkout)
+    if err := h.emailService.SendEmail(
+        checkout.Email,
+        "Your invoice has been delivered :)",
+        invoiceEmailContent,
+    ); err != nil {
+        log.Printf("Warning: Failed to send invoice email: %v", err)
+    }
+
+    log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
+    return nil}
