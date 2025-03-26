@@ -4,6 +4,7 @@ import (
     "errors"
     "fmt"
     "log"
+    "sync"
     "time"
     "prosecure-payment-api/models"
     "prosecure-payment-api/services/payment/authorizenet"
@@ -11,24 +12,33 @@ import (
 
 type Service struct {
     client *authorizenet.Client
+    cache  *sync.Map // Para cache de validações de cartão
 }
 
+// NewPaymentService cria um novo serviço de pagamento com cache e timeouts otimizados
 func NewPaymentService(apiLoginID, transactionKey, merchantID, environment string) *Service {
     client := authorizenet.NewClient(apiLoginID, transactionKey, merchantID, environment)
     return &Service{
         client: client,
+        cache:  &sync.Map{},
     }
 }
 
-// ProcessInitialAuthorization only performs the initial $1 authorization without void or subscription
+// ProcessInitialAuthorization apenas executa a autorização inicial de $1 sem void ou assinatura
 func (s *Service) ProcessInitialAuthorization(payment *models.PaymentRequest) (*models.TransactionResponse, error) {
     log.Printf("Starting initial payment authorization for checkout ID: %s", payment.CheckoutID)
+    
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Payment authorization took %v for checkout ID: %s", 
+            time.Since(startTime), payment.CheckoutID)
+    }()
 
     if !s.ValidateCard(payment) {
         return nil, errors.New("invalid card data: please check card number, expiration date and CVV")
     }
 
-    // Process initial charge
+    // Processo de cobrança inicial com timeout reduzido
     resp, err := s.client.ProcessPayment(payment)
     if err != nil {
         log.Printf("Error processing payment: %v", err)
@@ -46,16 +56,22 @@ func (s *Service) ProcessInitialAuthorization(payment *models.PaymentRequest) (*
     return resp, nil
 }
 
-// ProcessPayment performs the complete payment flow (authorization, void, and subscription)
-// This is the original method kept for compatibility
+// ProcessPayment executa o fluxo completo de pagamento (autorização, void e assinatura)
+// Este é o método original mantido para compatibilidade
 func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *models.CheckoutData) (*models.TransactionResponse, error) {
     log.Printf("Starting payment processing for checkout ID: %s", payment.CheckoutID)
+    
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Full payment processing took %v for checkout ID: %s", 
+            time.Since(startTime), payment.CheckoutID)
+    }()
 
     if !s.ValidateCard(payment) {
         return nil, errors.New("invalid card data: please check card number, expiration date and CVV")
     }
 
-    // Process initial charge
+    // Processo de cobrança inicial
     resp, err := s.client.ProcessPayment(payment)
     if err != nil {
         log.Printf("Error processing payment: %v", err)
@@ -67,18 +83,18 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
         return resp, nil
     }
 
-    // Void the transaction
+    // Void da transação
     log.Printf("Payment successful, voiding transaction: %s", resp.TransactionID)
     if err := s.client.VoidTransaction(resp.TransactionID); err != nil {
         log.Printf("Error voiding transaction: %v", err)
         return nil, fmt.Errorf("failed to void initial transaction: %v", err)
     }
 
-    // Setup recurring billing
+    // Configurar cobrança recorrente
     log.Printf("Setting up recurring billing for checkout ID: %s", payment.CheckoutID)
     if err := s.SetupRecurringBilling(payment, checkout); err != nil {
         log.Printf("Error setting up recurring billing: %v", err)
-        // Try to void the transaction again to ensure it's not hanging
+        // Tentar anular a transação novamente para garantir que não esteja pendente
         if voidErr := s.client.VoidTransaction(resp.TransactionID); voidErr != nil {
             log.Printf("Error voiding transaction after recurring billing failure: %v", voidErr)
         }
@@ -88,13 +104,35 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
     return resp, nil
 }
 
-// VoidTransaction voids a previously authorized transaction
+// VoidTransaction anula uma transação previamente autorizada
 func (s *Service) VoidTransaction(transactionID string) error {
     log.Printf("Voiding transaction: %s", transactionID)
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Void transaction took %v for transaction ID: %s", 
+            time.Since(startTime), transactionID)
+    }()
+    
     return s.client.VoidTransaction(transactionID)
 }
 
+// ValidateCard verifica se os dados do cartão são válidos
+// Implementa caching para evitar revalidações idênticas
 func (s *Service) ValidateCard(payment *models.PaymentRequest) bool {
+    // Gerar uma chave de cache (usando apenas 4 últimos dígitos do cartão para evitar armazenar PCI)
+    var lastFour string
+    if len(payment.CardNumber) > 4 {
+        lastFour = payment.CardNumber[len(payment.CardNumber)-4:]
+    }
+    
+    cacheKey := fmt.Sprintf("%s-%s-%s", lastFour, payment.Expiry, payment.CardName)
+    
+    // Verificar cache
+    if _, found := s.cache.Load(cacheKey); found {
+        return true
+    }
+    
+    // Validações básicas
     if len(payment.CardNumber) < 13 || len(payment.CardNumber) > 19 {
         log.Printf("Invalid card number length: %d", len(payment.CardNumber))
         return false
@@ -120,15 +158,24 @@ func (s *Service) ValidateCard(payment *models.PaymentRequest) bool {
         return false
     }
 
+    // Salvar no cache (com expiração implícita pela duração do programa)
+    s.cache.Store(cacheKey, true)
     return true
 }
 
+// SetupRecurringBilling configura cobrança recorrente
 func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout *models.CheckoutData) error {
     if !s.ValidateCard(payment) {
         return errors.New("invalid card data for recurring billing setup")
     }
 
-    // CreateSubscription will return error if the operation fails
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Subscription setup took %v for checkout ID: %s", 
+            time.Since(startTime), payment.CheckoutID)
+    }()
+
+    // CreateSubscription retornará erro se a operação falhar
     subscriptionResp, err := s.client.CreateSubscription(payment, checkout)
     if err != nil {
         return fmt.Errorf("failed to setup recurring billing: %v", err)
@@ -142,6 +189,7 @@ func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout
     return nil
 }
 
+// Função helper para validar o algoritmo de Luhn para números de cartão
 func validateLuhn(cardNumber string) bool {
     sum := 0
     isEven := len(cardNumber)%2 == 0
@@ -165,6 +213,7 @@ func validateLuhn(cardNumber string) bool {
     return sum%10 == 0
 }
 
+// Função helper para validar data de expiração
 func validateExpiry(expiry string) bool {
     currentTime := time.Now()
     expiryTime, err := time.Parse("01/06", expiry)

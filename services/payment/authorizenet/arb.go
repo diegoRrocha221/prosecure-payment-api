@@ -2,6 +2,7 @@ package authorizenet
 
 import (
     "bytes"
+    "context"  // Adicionado import do context
     "encoding/json"
     "fmt"
     "io"
@@ -31,19 +32,26 @@ func formatPhoneNumber(phone string) string {
 }
 
 func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *models.CheckoutData) (*models.SubscriptionResponse, error) {
+    startTime := time.Now()
+    defer func() {
+        log.Printf("CreateSubscription completed in %v for checkout: %s", 
+            time.Since(startTime), payment.CheckoutID)
+    }()
+    
     var total float64
     interval := IntervalType{
         Length: 1,
         Unit:   "months",
     }
 
+    // Calcular o total e definir o intervalo de cobrança
     for _, plan := range checkout.Plans {
         if plan.Annually == 1 {
             interval = IntervalType{
                 Length: 12,
                 Unit:   "months",
             }
-            total += plan.Price * 10 // 10 months for annual
+            total += plan.Price * 10 // 10 meses para anual (desconto de 2 meses)
         } else {
             total += plan.Price
         }
@@ -51,6 +59,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
 
     log.Printf("Creating subscription with total amount: %.2f", total)
 
+    // Extrair nome e sobrenome
     names := strings.Fields(checkout.Name)
     firstName := names[0]
     lastName := ""
@@ -58,12 +67,16 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         lastName = strings.Join(names[1:], " ")
     }
 
+    // Formatar número de telefone
     formattedPhone := formatPhoneNumber(checkout.PhoneNumber)
     if formattedPhone == "" {
         log.Printf("Warning: Could not format phone number %s, omitting from request", checkout.PhoneNumber)
     }
 
+    // Definir data de início para um mês após a data atual
     startDate := time.Now().AddDate(0, 1, 0).Format("2006-01-02") 
+    
+    // Construir a requisição de assinatura
     subscription := ARBSubscriptionRequest{
         MerchantAuthentication: c.getMerchantAuthentication(),
         RefID: payment.CheckoutID,
@@ -72,7 +85,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
             PaymentSchedule: PaymentScheduleType{
                 Interval:         interval,
                 StartDate:       startDate,
-                TotalOccurrences: "9999", // Ongoing subscription
+                TotalOccurrences: "9999", // Assinatura contínua
             },
             Amount: fmt.Sprintf("%.2f", total),
             Payment: PaymentType{
@@ -103,6 +116,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         },
     }
 
+    // Serializar para JSON
     jsonPayload, err := json.Marshal(map[string]interface{}{
         "ARBCreateSubscriptionRequest": subscription,
     })
@@ -110,16 +124,25 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         return nil, fmt.Errorf("error marshaling subscription request: %v", err)
     }
 
-    log.Printf("ARB request to Authorize.net: %s", string(jsonPayload))
+    log.Printf("Sending ARB request to Authorize.net for checkout: %s", payment.CheckoutID)
 
-    httpReq, err := http.NewRequest("POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
+    // Criar contexto com timeout para controle de tempo da requisição
+    ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout) 
+    defer cancel()
+    
+    httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
     if err != nil {
         return nil, fmt.Errorf("error creating ARB request: %v", err)
     }
 
     httpReq.Header.Set("Content-Type", "application/json")
+    httpReq.Header.Set("Cache-Control", "no-cache")
 
+    // Usar mutex para garantir thread safety
+    c.mutex.Lock()
     resp, err := c.client.Do(httpReq)
+    c.mutex.Unlock()
+    
     if err != nil {
         return nil, fmt.Errorf("error making ARB request: %v", err)
     }
@@ -130,9 +153,10 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         return nil, fmt.Errorf("error reading ARB response body: %v", err)
     }
 
-    log.Printf("ARB response from Authorize.net: %s", string(respBody))
+    log.Printf("ARB response received in %v for checkout: %s", 
+        time.Since(startTime), payment.CheckoutID)
 
-    // Remove BOM if present
+    // Remover BOM se presente
     cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")
 
     var response ARBResponse

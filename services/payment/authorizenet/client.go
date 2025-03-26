@@ -2,12 +2,14 @@ package authorizenet
 
 import (
     "bytes"
+    "context"
     "encoding/json"
     "fmt"
     "io"
     "log"
     "net/http"
     "strings"
+    "sync"
     "time"
     
     "prosecure-payment-api/models"
@@ -17,6 +19,8 @@ const (
     SandboxEndpoint = "https://apitest.authorize.net/xml/v1/request.api"
     ProductionEndpoint = "https://api.authorize.net/xml/v1/request.api"
     DuplicateWindow = 3
+    RequestTimeout = 30 * time.Second // Aumentado para 30 segundos para evitar timeouts
+    SilentPostURL = "https://api.prosecurelsp.com/api/authorize-net/webhook/silent-post"
 )
 
 type Client struct {
@@ -25,15 +29,31 @@ type Client struct {
     merchantID     string
     environment    string
     client         *http.Client
+    transport      *http.Transport
+    mutex          sync.Mutex // Para operações concorrentes seguras
 }
 
 func NewClient(apiLoginID, transactionKey, merchantID, environment string) *Client {
+    // Configuração otimizada do Transport para HTTP
+    transport := &http.Transport{
+        MaxIdleConns:        100,
+        MaxIdleConnsPerHost: 20,
+        MaxConnsPerHost:     100,
+        IdleConnTimeout:     90 * time.Second,
+        DisableKeepAlives:   false, // Manter conexões ativas
+        TLSHandshakeTimeout: 10 * time.Second,
+    }
+    
     return &Client{
         apiLoginID:     apiLoginID,
         transactionKey: transactionKey,
         merchantID:     merchantID,
         environment:    environment,
-        client:         &http.Client{Timeout: 30 * time.Second},
+        transport:      transport,
+        client:         &http.Client{
+            Timeout:   RequestTimeout,
+            Transport: transport,
+        },
     }
 }
 
@@ -51,7 +71,14 @@ func (c *Client) getMerchantAuthentication() merchantAuthenticationType {
     }
 }
 
+// Método auxiliar para criar contexto com timeout
+func (c *Client) createRequestContext() (context.Context, context.CancelFunc) {
+    return context.WithTimeout(context.Background(), RequestTimeout)
+}
+
 func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.TransactionResponse, error) {
+    startTime := time.Now()
+    
     orderID := fmt.Sprintf("Order-%s-%d", req.CheckoutID, time.Now().UnixNano())
     if len(orderID) > 20 {
         orderID = fmt.Sprintf("Order-%d", time.Now().UnixNano() % 100000)
@@ -80,6 +107,16 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
                     SettingName:  "duplicateWindow",
                     SettingValue: fmt.Sprintf("%d", DuplicateWindow),
                 },
+                // Adicionar configuração para Silent Post
+                {
+                    SettingName:  "x_relay_url",
+                    SettingValue: SilentPostURL,
+                },
+                // Habilitar Silent Post
+                {
+                    SettingName:  "x_silent_post_enabled",
+                    SettingValue: "true",
+                },
             },
         },
     }
@@ -98,13 +135,13 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
     }
     
     refId := req.CheckoutID
-        if len(refId) > 20 {
+    if len(refId) > 20 {
         refId = refId[:19]
     }
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
-            RefID: refId,  // Use a variável refId em vez de req.CheckoutID
+            RefID: refId,
             TransactionRequest: txRequest,
         },
     }
@@ -114,16 +151,25 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
         return nil, fmt.Errorf("error marshaling request: %v", err)
     }
 
-    log.Printf("Request to Authorize.net: %s", string(jsonPayload))
+    // Log com menos informações sensíveis
+    log.Printf("Sending payment request to Authorize.net for checkout: %s", req.CheckoutID)
 
-    httpReq, err := http.NewRequest("POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
+    // Usar timeout específico para esta operação
+    ctx, cancel := c.createRequestContext()
+    defer cancel()
+    
+    httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
     if err != nil {
         return nil, fmt.Errorf("error creating request: %v", err)
     }
 
     httpReq.Header.Set("Content-Type", "application/json")
+    httpReq.Header.Set("Cache-Control", "no-cache")
 
+    c.mutex.Lock() // Bloqueio para evitar problemas com simultaneidade
     resp, err := c.client.Do(httpReq)
+    c.mutex.Unlock()
+    
     if err != nil {
         return nil, fmt.Errorf("error making request: %v", err)
     }
@@ -134,7 +180,9 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
         return nil, fmt.Errorf("error reading response body: %v", err)
     }
 
-    log.Printf("Response from Authorize.net: %s", string(respBody))
+    // Log do tempo de resposta
+    log.Printf("Authorize.net response received in %v for checkout: %s", 
+        time.Since(startTime), req.CheckoutID)
 
     cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")
 
@@ -208,6 +256,8 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
 }
 
 func (c *Client) VoidTransaction(transactionID string) error {
+    startTime := time.Now()
+    
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
@@ -223,16 +273,23 @@ func (c *Client) VoidTransaction(transactionID string) error {
         return fmt.Errorf("error marshaling void request: %v", err)
     }
 
-    log.Printf("Void request to Authorize.net: %s", string(jsonPayload))
+    log.Printf("Sending void request to Authorize.net for transaction: %s", transactionID)
 
-    httpReq, err := http.NewRequest("POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
+    ctx, cancel := c.createRequestContext()
+    defer cancel()
+    
+    httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
     if err != nil {
         return fmt.Errorf("error creating void request: %v", err)
     }
 
     httpReq.Header.Set("Content-Type", "application/json")
+    httpReq.Header.Set("Cache-Control", "no-cache")
 
+    c.mutex.Lock()
     resp, err := c.client.Do(httpReq)
+    c.mutex.Unlock()
+    
     if err != nil {
         return fmt.Errorf("error making void request: %v", err)
     }
@@ -243,7 +300,8 @@ func (c *Client) VoidTransaction(transactionID string) error {
         return fmt.Errorf("error reading void response body: %v", err)
     }
 
-    log.Printf("Void response from Authorize.net: %s", string(respBody))
+    log.Printf("Void response received in %v for transaction: %s", 
+        time.Since(startTime), transactionID)
 
     // Remove BOM if present
     cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")

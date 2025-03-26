@@ -89,8 +89,9 @@ func (w *Worker) processJobs(workerID int) {
 			log.Printf("Worker %d shutting down", workerID)
 			return
 		default:
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			job, err := w.queue.Dequeue(ctx, 5*time.Second)
+			// Reduzido timeout para melhorar responsividade
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			job, err := w.queue.Dequeue(ctx, 3*time.Second)
 			cancel()
 			
 			if err != nil {
@@ -277,11 +278,20 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 	
 	// Verificar se ainda temos dados insuficientes
 	if cardName == "" || cardNumber == "" || expiry == "" || cvv == "" {
-		return fmt.Errorf("insufficient payment data for subscription creation. Fields missing: %s%s%s%s", 
-			cardName == "" ? "cardName " : "", 
-			cardNumber == "" ? "cardNumber " : "", 
-			expiry == "" ? "expiry " : "", 
-			cvv == "" ? "cvv" : "")
+		missingFields := ""
+		if cardName == "" {
+			missingFields += "cardName "
+		}
+		if cardNumber == "" {
+			missingFields += "cardNumber "
+		}
+		if expiry == "" {
+			missingFields += "expiry "
+		}
+		if cvv == "" {
+			missingFields += "cvv"
+		}
+		return fmt.Errorf("insufficient payment data for subscription creation. Fields missing: %s", missingFields)
 	}
 	
 	// Criar objeto de requisição de pagamento com os dados obtidos
@@ -326,6 +336,18 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 	}
 	
 	log.Printf("Successfully set up subscription for checkout %s", checkoutID)
+	
+	// Limpar os dados temporários do cartão depois de processar com sucesso
+	cleanCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	_, err = w.db.GetDB().ExecContext(cleanCtx,
+		"DELETE FROM temp_payment_data WHERE checkout_id = ?",
+		checkoutID)
+	
+	if err != nil {
+		log.Printf("Warning: Failed to clean up temporary payment data: %v", err)
+	}
 	
 	return nil
 }

@@ -35,20 +35,26 @@ func (h *WebhookHandler) HandleSilentPost(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Log completo para debug
+	log.Printf("Silent Post form data: %+v", r.Form)
+
 	// Log da notificação recebida
 	transactionID := r.FormValue("x_trans_id")
 	responseCode := r.FormValue("x_response_code")
 	responseReasonCode := r.FormValue("x_response_reason_code")
 	responseReasonText := r.FormValue("x_response_reason_text")
+	invoiceNum := r.FormValue("x_invoice_num")
+	amount := r.FormValue("x_amount")
+	checkoutID := r.FormValue("x_ref_id") // Adicionado para capturar o ID do checkout (vem como refId)
 	
-	log.Printf("Received Silent Post notification for transaction %s: code=%s, reason=%s, text=%s",
-		transactionID, responseCode, responseReasonCode, responseReasonText)
+	log.Printf("Received Silent Post notification: tx_id=%s, code=%s, reason=%s, text=%s, invoice=%s, amount=%s, checkout_id=%s",
+		transactionID, responseCode, responseReasonCode, responseReasonText, invoiceNum, amount, checkoutID)
 
 	// Enviar uma resposta 200 OK imediatamente
 	w.WriteHeader(http.StatusOK)
 	
 	// Processar o resultado em background
-	go h.processNotification(transactionID, responseCode)
+	go h.processNotification(transactionID, responseCode, checkoutID)
 }
 
 // HandleRelayResponse processa os redirecionamentos da Authorize.net via Relay Response
@@ -59,11 +65,16 @@ func (h *WebhookHandler) HandleRelayResponse(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Log completo para debug
+	log.Printf("Relay Response form data: %+v", r.Form)
+
 	// Log do redirecionamento recebido
 	transactionID := r.FormValue("x_trans_id")
 	responseCode := r.FormValue("x_response_code")
+	checkoutID := r.FormValue("x_ref_id") // Adicionado para capturar o ID do checkout
 	
-	log.Printf("Received Relay Response for transaction %s: code=%s", transactionID, responseCode)
+	log.Printf("Received Relay Response for transaction %s: code=%s, checkout_id=%s", 
+	    transactionID, responseCode, checkoutID)
 
 	// Responder com HTML que será exibido ao cliente (pode redirecionar para sua página de sucesso/erro)
 	w.Header().Set("Content-Type", "text/html")
@@ -81,7 +92,7 @@ func (h *WebhookHandler) HandleRelayResponse(w http.ResponseWriter, r *http.Requ
 	`))
 	
 	// Processar o resultado em background
-	go h.processNotification(transactionID, responseCode)
+	go h.processNotification(transactionID, responseCode, checkoutID)
 }
 
 // HandleSubscriptionNotification processa notificações relacionadas a assinaturas
@@ -91,6 +102,9 @@ func (h *WebhookHandler) HandleSubscriptionNotification(w http.ResponseWriter, r
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+
+	// Log completo para debug
+	log.Printf("Subscription notification form data: %+v", r.Form)
 
 	// Extrair informações relevantes
 	subscriptionID := r.FormValue("x_subscription_id")
@@ -107,7 +121,7 @@ func (h *WebhookHandler) HandleSubscriptionNotification(w http.ResponseWriter, r
 }
 
 // processNotification processa as notificações e enfileira jobs conforme necessário
-func (h *WebhookHandler) processNotification(transactionID, responseCode string) {
+func (h *WebhookHandler) processNotification(transactionID, responseCode, checkoutID string) {
 	// Apenas processa se a transação foi aprovada (código 1)
 	if responseCode != "1" {
 		log.Printf("Transaction %s not approved (response code %s). No background jobs will be queued.", 
@@ -115,43 +129,138 @@ func (h *WebhookHandler) processNotification(transactionID, responseCode string)
 		return
 	}
 
-	// Buscar informações da transação no banco de dados
+	// Criar um contexto com timeout para as operações
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	// Verificar se a transação já foi processada
-	var status string
-	err := h.db.GetDB().QueryRowContext(ctx, 
-		"SELECT status FROM transactions WHERE transaction_id = ?", 
-		transactionID).Scan(&status)
+	
+	// Inserir ou atualizar os dados de pagamento temporários
+	_, err := h.db.GetDB().ExecContext(ctx,
+		`INSERT INTO temp_payment_data
+		 (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
+		 VALUES (?, ?, ?, ?, ?, NOW())
+		 ON DUPLICATE KEY UPDATE
+		 card_number = VALUES(card_number),
+		 card_expiry = VALUES(card_expiry),
+		 card_cvv = VALUES(card_cvv),
+		 card_name = VALUES(card_name),
+		 created_at = NOW()`,
+		checkoutID, cardNumber, cardExpiry, cardCVV, cardName)
 	
 	if err != nil {
-		if err == sql.ErrNoRows {
-			log.Printf("Transaction %s not found in database", transactionID)
-		} else {
-			log.Printf("Error checking transaction status: %v", err)
+		log.Printf("Error storing temporary payment data: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "Failed to store payment data")
+		return
+	}
+	
+	// Configurar uma limpeza programada após algumas horas por segurança
+	go func() {
+		time.Sleep(1 * time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		_, err := h.db.GetDB().ExecContext(ctx,
+			"DELETE FROM temp_payment_data WHERE checkout_id = ?",
+			checkoutID)
+		
+		if err != nil {
+			log.Printf("Error cleaning up temporary payment data: %v", err)
 		}
-		return
-	}
+	}()
 	
-	// Se a transação já foi processada (void ou falha), não processa novamente
-	if status != "authorized" {
-		log.Printf("Transaction %s has already been processed (status=%s). Skipping.", 
-			transactionID, status)
-		return
+	sendSuccessResponse(w, models.APIResponse{
+		Status:  "success",
+		Message: "Payment data stored temporarily",
+	})
+}.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Se o checkoutID não foi fornecido, tenta buscar do banco de dados
+	if checkoutID == "" {
+		err := h.db.GetDB().QueryRowContext(ctx, 
+			"SELECT checkout_id FROM transactions WHERE transaction_id = ? LIMIT 1", 
+			transactionID).Scan(&checkoutID)
+		
+		if err != nil {
+			if err == sql.ErrNoRows {
+				log.Printf("Transaction %s not found in database", transactionID)
+			} else {
+				log.Printf("Error finding checkout ID for transaction %s: %v", transactionID, err)
+			}
+			return
+		}
 	}
 
-	// Buscar o checkout_id associado à transação
-	var checkoutID string
-	err = h.db.GetDB().QueryRowContext(ctx, 
-		"SELECT checkout_id FROM transactions WHERE transaction_id = ?", 
-		transactionID).Scan(&checkoutID)
+	// Verificar se a transação já existe no banco de dados
+	var status string
+	var exists bool
+	err := h.db.GetDB().QueryRowContext(ctx, 
+		"SELECT EXISTS(SELECT 1 FROM transactions WHERE transaction_id = ?)", 
+		transactionID).Scan(&exists)
 	
 	if err != nil {
-		log.Printf("Error finding checkout ID for transaction %s: %v", transactionID, err)
+		log.Printf("Error checking transaction existence: %v", err)
 		return
 	}
+	
+	if !exists {
+		log.Printf("Transaction %s not found in database. Adding as new transaction.", transactionID)
+		
+		// Se a transação não existir no banco, buscar as informações do checkout
+		checkout, err := h.db.GetCheckoutData(checkoutID)
+		if err != nil {
+			log.Printf("Error retrieving checkout data for ID %s: %v", checkoutID, err)
+			return
+		}
+		
+		// Buscar o master_reference associado ao checkout (se existir)
+		var masterRef string
+		err = h.db.GetDB().QueryRowContext(ctx, 
+			`SELECT reference_uuid FROM master_accounts 
+			 WHERE username = ? AND email = ? LIMIT 1`,
+			checkout.Username, checkout.Email).Scan(&masterRef)
+		
+		if err != nil {
+			if err == sql.ErrNoRows {
+				log.Printf("No master account found for checkout %s", checkoutID)
+				return
+			}
+			log.Printf("Error retrieving master reference: %v", err)
+			return
+		}
+		
+		// Registrar a transação no banco de dados
+		_, err = h.db.GetDB().ExecContext(ctx,
+			`INSERT INTO transactions (id, master_reference, checkout_id, amount, status, transaction_id, created_at)
+			 VALUES (UUID(), ?, ?, 1.00, 'authorized', ?, NOW())`,
+			masterRef, checkoutID, transactionID)
+			
+		if err != nil {
+			log.Printf("Error registering transaction in database: %v", err)
+			return
+		}
+		
+		log.Printf("Successfully registered transaction %s for checkout %s", transactionID, checkoutID)
+	} else {
+		// Se a transação já existe, verificar o status
+		err := h.db.GetDB().QueryRowContext(ctx, 
+			"SELECT status FROM transactions WHERE transaction_id = ?", 
+			transactionID).Scan(&status)
+		
+		if err != nil {
+			log.Printf("Error checking transaction status: %v", err)
+			return
+		}
+		
+		// Se a transação já foi processada (void ou falha), não processa novamente
+		if status != "authorized" {
+			log.Printf("Transaction %s has already been processed (status=%s). Skipping.", 
+				transactionID, status)
+			return
+		}
+	}
 
+	log.Printf("Processing notification for transaction %s, checkout %s", transactionID, checkoutID)
+	
 	// Enfileirar job para anular a transação (void)
 	err = h.queue.Enqueue(ctx, queue.JobTypeVoidTransaction, map[string]interface{}{
 		"transaction_id": transactionID,
@@ -257,14 +366,27 @@ func (h *WebhookHandler) processSubscriptionNotification(subscriptionID, eventTy
 	if eventType == "subscription_failed" {
 		log.Printf("Subscription payment failed for subscription %s. Consider sending a notification.", subscriptionID)
 		
-		// Código para enviar notificação de falha por email pode ser adicionado aqui
+		// Buscar email do usuário para envio de notificação
+		var email string
+		err := h.db.GetDB().QueryRowContext(ctx, 
+			`SELECT ma.email FROM master_accounts ma 
+			 JOIN subscriptions s ON s.master_reference = ma.reference_uuid 
+			 WHERE s.subscription_id = ?`, 
+			subscriptionID).Scan(&email)
+		
+		if err != nil {
+			log.Printf("Error retrieving email for subscription %s: %v", subscriptionID, err)
+			return
+		}
+		
+		// Aqui poderia ser implementado o envio de email de notificação
+		log.Printf("Should send notification email to %s regarding subscription failure", email)
 	}
 }
 
 // Função para armazenar temporariamente os dados do cartão de forma segura
-// Nota: Em produção, considere usar criptografia ou tokenização
 func (h *WebhookHandler) StoreTemporaryPaymentData(w http.ResponseWriter, r *http.Request) {
-	// Removendo variável não utilizada
+	// Parse do formulário
 	if err := r.ParseForm(); err != nil {
 		log.Printf("Error parsing payment storage form: %v", err)
 		sendErrorResponse(w, http.StatusBadRequest, "Invalid request format")
@@ -282,45 +404,5 @@ func (h *WebhookHandler) StoreTemporaryPaymentData(w http.ResponseWriter, r *htt
 		return
 	}
 	
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	
-	// Inserir ou atualizar os dados de pagamento temporários
-	_, err := h.db.GetDB().ExecContext(ctx,
-		`INSERT INTO temp_payment_data
-		 (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
-		 VALUES (?, ?, ?, ?, ?, NOW())
-		 ON DUPLICATE KEY UPDATE
-		 card_number = VALUES(card_number),
-		 card_expiry = VALUES(card_expiry),
-		 card_cvv = VALUES(card_cvv),
-		 card_name = VALUES(card_name),
-		 created_at = NOW()`,
-		checkoutID, cardNumber, cardExpiry, cardCVV, cardName)
-	
-	if err != nil {
-		log.Printf("Error storing temporary payment data: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to store payment data")
-		return
-	}
-	
-	// Configurar uma limpeza programada após algumas horas por segurança
-	go func() {
-		time.Sleep(1 * time.Hour)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		
-		_, err := h.db.GetDB().ExecContext(ctx,
-			"DELETE FROM temp_payment_data WHERE checkout_id = ?",
-			checkoutID)
-		
-		if err != nil {
-			log.Printf("Error cleaning up temporary payment data: %v", err)
-		}
-	}()
-	
-	sendSuccessResponse(w, models.APIResponse{
-		Status:  "success",
-		Message: "Payment data stored temporarily",
-	})
+	ctx, cancel := context
 }

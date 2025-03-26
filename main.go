@@ -8,6 +8,7 @@ import (
     "net/http"
     "os"
     "os/signal"
+    "runtime"
     "syscall"
     "time"
     
@@ -28,6 +29,8 @@ func corsMiddleware(next http.Handler) http.Handler {
         w.Header().Set("Access-Control-Allow-Origin", "*")
         w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT")
         w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization, h-captcha-response")
+        
+        // Responder imediatamente para OPTIONS
         if r.Method == "OPTIONS" {
             w.WriteHeader(http.StatusOK)
             return
@@ -53,40 +56,55 @@ func loggingMiddleware(next http.Handler) http.Handler {
         wrapper := &responseWriter{ResponseWriter: w, status: http.StatusOK}
         next.ServeHTTP(wrapper, r)
 
-        log.Printf(
-            "%s %s %s %d %v",
-            r.Method,
-            r.RequestURI,
-            r.RemoteAddr,
-            wrapper.status,
-            time.Since(start),
-        )
+        // Registrar apenas requisições com duração longa ou erros
+        elapsed := time.Since(start)
+        if elapsed > 500*time.Millisecond || wrapper.status >= 400 {
+            log.Printf(
+                "%s %s %s %d %v",
+                r.Method,
+                r.RequestURI,
+                r.RemoteAddr,
+                wrapper.status,
+                elapsed,
+            )
+        }
     })
 }
 
 func main() {
-    log.SetFlags(log.LstdFlags | log.Lshortfile | log.LUTC)
+    // Configurar logging com timestamp preciso
+    log.SetFlags(log.LstdFlags | log.Lshortfile | log.Lmicroseconds | log.LUTC)
+    
+    // Otimizar o número de CPUs que Go pode usar
+    numCPU := runtime.NumCPU()
+    runtime.GOMAXPROCS(numCPU)
+    log.Printf("Server starting with %d CPUs available", numCPU)
 
+    // Carregar configurações
     cfg := config.Load()
-    log.Printf("Starting server with configuration: %+v", cfg)
+    log.Printf("Configuration loaded successfully")
 
-    // Connect to database
+    // Conectar ao banco de dados com retry
     var db *database.Connection
     var err error
-    for retries := 0; retries < 3; retries++ {
+    for retries := 0; retries < 5; retries++ {
         db, err = database.NewConnection(cfg.Database)
         if err == nil {
             break
         }
-        log.Printf("Failed to connect to database (attempt %d/3): %v", retries+1, err)
-        time.Sleep(time.Second * time.Duration(retries+1))
+        retryDelay := time.Duration(retries+1) * time.Second
+        log.Printf("Failed to connect to database (attempt %d/5): %v. Retrying in %v...", 
+            retries+1, err, retryDelay)
+        time.Sleep(retryDelay)
     }
+    
     if err != nil {
         log.Fatalf("Failed to connect to database after retries: %v", err)
     }
     defer db.Close()
 
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    // Verificar a conexão com o banco de dados
+    ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
     defer cancel()
     
     if err := db.GetDB().PingContext(ctx); err != nil {
@@ -94,7 +112,7 @@ func main() {
     }
     log.Println("Successfully connected to database")
 
-    // Initialize Redis queue
+    // Inicializar fila Redis
     jobQueue, err := queue.NewQueue(cfg.Redis.URL, "payment_jobs")
     if err != nil {
         log.Fatalf("Failed to connect to Redis: %v", err)
@@ -102,7 +120,7 @@ func main() {
     defer jobQueue.Close()
     log.Println("Successfully connected to Redis")
 
-    // Initialize services
+    // Inicializar serviços
     paymentService := payment.NewPaymentService(
         cfg.AuthNet.APILoginID,
         cfg.AuthNet.TransactionKey,
@@ -111,13 +129,20 @@ func main() {
     )
     emailService := email.NewSMTPService(cfg.SMTP)
 
-    // Start the worker
+    // Iniciar o worker com quantidade otimizada de threads
+    workerConcurrency := cfg.Redis.WorkerConcurrency
+    if workerConcurrency < 2 {
+        workerConcurrency = 2
+    } else if workerConcurrency > 8 {
+        workerConcurrency = 8 // Limitar para evitar sobrecarga
+    }
+    
     paymentWorker := worker.NewWorker(jobQueue, db, paymentService)
-    paymentWorker.Start(cfg.Redis.WorkerConcurrency)
+    paymentWorker.Start(workerConcurrency)
     defer paymentWorker.Stop()
-    log.Printf("Started payment worker with %d threads", cfg.Redis.WorkerConcurrency)
+    log.Printf("Started payment worker with %d threads", workerConcurrency)
 
-    // Initialize handlers
+    // Inicializar handlers
     var paymentHandler *handlers.PaymentHandler
     for retries := 0; retries < 3; retries++ {
         paymentHandler, err = handlers.NewPaymentHandler(db, paymentService, emailService, jobQueue)
@@ -131,20 +156,18 @@ func main() {
         log.Fatalf("Failed to initialize payment handler after retries: %v", err)
     }
 
-    // Initialize webhook handler
+    // Inicializar outros handlers
     webhookHandler := handlers.NewWebhookHandler(db, jobQueue, paymentService)
-
-    // Initialize other handlers
     planHandler := handlers.NewPlanHandler(db)
     cartHandler := handlers.NewCartHandler(db, cfg)
     checkoutHandler := handlers.NewCheckoutHandler(db)
     linkAccountHandler := handlers.NewLinkAccountHandler(db, cfg)
 
-    // Set up router
+    // Configurar o router com middleware otimizados
     router := mux.NewRouter()
     router.Use(corsMiddleware)
     router.Use(loggingMiddleware)
-
+    
     api := router.PathPrefix("/api").Subrouter()
     
     // Payment processing endpoints
@@ -154,7 +177,7 @@ func main() {
     api.HandleFunc("/update-checkout-id", paymentHandler.UpdateCheckoutID).Methods("POST")
     api.HandleFunc("/check-checkout-status", paymentHandler.CheckCheckoutStatus).Methods("GET")
     
-    // Webhook endpoints
+    // Webhook endpoints - Configuração das rotas de webhook
     webhookRouter := api.PathPrefix("/authorize-net/webhook").Subrouter()
     webhookRouter.HandleFunc("/silent-post", webhookHandler.HandleSilentPost).Methods("POST")
     webhookRouter.HandleFunc("/relay-response", webhookHandler.HandleRelayResponse).Methods("POST")
@@ -171,30 +194,45 @@ func main() {
     api.HandleFunc("/cart", cartHandler.UpdateCart).Methods("PUT", "OPTIONS")
     api.HandleFunc("/cart", cartHandler.GetCart).Methods("GET", "OPTIONS")
     api.HandleFunc("/cart/remove", cartHandler.RemoveFromCart).Methods("POST", "OPTIONS")
-
-    // Health check endpoint
+    // Registrar hora de início para cálculo de uptime
+    startTime := time.Now()
+    
+    // Endpoint de health check
     api.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        // Criar contexto com timeout curto para health checks
+        ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+        defer cancel()
+        
         health := struct {
             Status    string    `json:"status"`
             Time      string    `json:"time"`
             Database  string    `json:"database"`
             Redis     string    `json:"redis"`
+            Uptime    string    `json:"uptime"`
+            GoVersion string    `json:"go_version"`
         }{
-            Status:   "ok",
-            Time:     time.Now().Format(time.RFC3339),
-            Database: "connected",
-            Redis:    "connected",
+            Status:    "ok",
+            Time:      time.Now().Format(time.RFC3339),
+            Database:  "connected",
+            Redis:     "connected",
+            Uptime:    fmt.Sprintf("%v", time.Since(startTime)),
+            GoVersion: runtime.Version(),
         }
 
-        if err := db.Ping(); err != nil {
+        // Verificar conexão com banco de dados
+        dbCtx, dbCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+        defer dbCancel()
+        
+        if err := db.GetDB().PingContext(dbCtx); err != nil {
             health.Status = "degraded"
             health.Database = "error"
         }
 
-        ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-        defer cancel()
+        // Verificar conexão com Redis
+        redisCtx, redisCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+        defer redisCancel()
         
-        if err := jobQueue.Client().Ping(ctx).Err(); err != nil {
+        if err := jobQueue.Client().Ping(redisCtx).Err(); err != nil {
             health.Status = "degraded"
             health.Redis = "error"
         }
@@ -203,17 +241,17 @@ func main() {
         json.NewEncoder(w).Encode(health)
     }).Methods("GET")
 
+    // Configurar servidor HTTP com timeouts otimizados
     srv := &http.Server{
         Addr:         fmt.Sprintf(":%s", cfg.Server.Port),
         Handler:      router,
         ReadTimeout:  15 * time.Second,
-        WriteTimeout: 15 * time.Second,
-        IdleTimeout:  60 * time.Second,
+        WriteTimeout: 30 * time.Second,  // Aumentado para comportar operações mais longas
+        IdleTimeout:  120 * time.Second, // Dobrado para manter conexões ativas por mais tempo
+        MaxHeaderBytes: 1 << 20,         // 1MB para cabeçalhos (default é 1MB)
     }
 
-    stop := make(chan os.Signal, 1)
-    signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
+    // Iniciar servidor em goroutine separada
     go func() {
         log.Printf("Server starting on port %s", cfg.Server.Port)
         if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -221,20 +259,37 @@ func main() {
         }
     }()
 
+    // Configurar canal para capturar sinais de encerramento
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+
+    // Aguardar o sinal de parada
     <-stop
-    log.Println("Shutting down server...")
+    log.Println("Shutdown signal received, gracefully shutting down...")
 
-    ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
+    // Criar contexto com timeout para encerramento
 
-    // First shutdown the HTTP server
+
+    // Primeiro encerrar o HTTP server
+    log.Println("Shutting down HTTP server...")
     if err := srv.Shutdown(ctx); err != nil {
         log.Printf("Server forced to shutdown: %v", err)
     }
 
-    // Then stop the worker
+    // Depois parar o worker
+    log.Println("Stopping payment worker...")
     paymentWorker.Stop()
-    log.Println("Payment worker stopped")
+    
+    // Tempo para workers finalizarem
+    time.Sleep(2 * time.Second)
+    
+    // Fechar conexões de banco de dados
+    log.Println("Closing database connections...")
+    db.Close()
+    
+    // Fechar conexões com Redis
+    log.Println("Closing Redis connections...")
+    jobQueue.Close()
 
     log.Println("Server exited properly")
 }
