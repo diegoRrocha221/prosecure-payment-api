@@ -11,6 +11,7 @@ import (
 	"prosecure-payment-api/models"
 	"prosecure-payment-api/queue"
 	"prosecure-payment-api/services/payment"
+	"prosecure-payment-api/utils"
 )
 
 type WebhookHandler struct {
@@ -130,48 +131,7 @@ func (h *WebhookHandler) processNotification(transactionID, responseCode, checko
 	}
 
 	// Criar um contexto com timeout para as operações
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	
-	// Inserir ou atualizar os dados de pagamento temporários
-	_, err := h.db.GetDB().ExecContext(ctx,
-		`INSERT INTO temp_payment_data
-		 (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
-		 VALUES (?, ?, ?, ?, ?, NOW())
-		 ON DUPLICATE KEY UPDATE
-		 card_number = VALUES(card_number),
-		 card_expiry = VALUES(card_expiry),
-		 card_cvv = VALUES(card_cvv),
-		 card_name = VALUES(card_name),
-		 created_at = NOW()`,
-		checkoutID, cardNumber, cardExpiry, cardCVV, cardName)
-	
-	if err != nil {
-		log.Printf("Error storing temporary payment data: %v", err)
-		sendErrorResponse(w, http.StatusInternalServerError, "Failed to store payment data")
-		return
-	}
-	
-	// Configurar uma limpeza programada após algumas horas por segurança
-	go func() {
-		time.Sleep(1 * time.Hour)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		
-		_, err := h.db.GetDB().ExecContext(ctx,
-			"DELETE FROM temp_payment_data WHERE checkout_id = ?",
-			checkoutID)
-		
-		if err != nil {
-			log.Printf("Error cleaning up temporary payment data: %v", err)
-		}
-	}()
-	
-	sendSuccessResponse(w, models.APIResponse{
-		Status:  "success",
-		Message: "Payment data stored temporarily",
-	})
-}.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	// Se o checkoutID não foi fornecido, tenta buscar do banco de dados
@@ -384,12 +344,12 @@ func (h *WebhookHandler) processSubscriptionNotification(subscriptionID, eventTy
 	}
 }
 
-// Função para armazenar temporariamente os dados do cartão de forma segura
+// StoreTemporaryPaymentData armazena temporariamente os dados do cartão de forma segura
 func (h *WebhookHandler) StoreTemporaryPaymentData(w http.ResponseWriter, r *http.Request) {
 	// Parse do formulário
 	if err := r.ParseForm(); err != nil {
 		log.Printf("Error parsing payment storage form: %v", err)
-		sendErrorResponse(w, http.StatusBadRequest, "Invalid request format")
+		utils.SendErrorResponse(w, http.StatusBadRequest, "Invalid request format")
 		return
 	}
 	
@@ -400,9 +360,49 @@ func (h *WebhookHandler) StoreTemporaryPaymentData(w http.ResponseWriter, r *htt
 	cardName := r.FormValue("card_name")
 	
 	if checkoutID == "" || cardNumber == "" || cardExpiry == "" || cardCVV == "" || cardName == "" {
-		sendErrorResponse(w, http.StatusBadRequest, "Missing required payment information")
+		utils.SendErrorResponse(w, http.StatusBadRequest, "Missing required payment information")
 		return
 	}
 	
-	ctx, cancel := context
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// Inserir ou atualizar os dados de pagamento temporários
+	_, err := h.db.GetDB().ExecContext(ctx,
+		`INSERT INTO temp_payment_data
+		 (checkout_id, card_number, card_expiry, card_cvv, card_name, created_at)
+		 VALUES (?, ?, ?, ?, ?, NOW())
+		 ON DUPLICATE KEY UPDATE
+		 card_number = VALUES(card_number),
+		 card_expiry = VALUES(card_expiry),
+		 card_cvv = VALUES(card_cvv),
+		 card_name = VALUES(card_name),
+		 created_at = NOW()`,
+		checkoutID, cardNumber, cardExpiry, cardCVV, cardName)
+	
+	if err != nil {
+		log.Printf("Error storing temporary payment data: %v", err)
+		utils.SendErrorResponse(w, http.StatusInternalServerError, "Failed to store payment data")
+		return
+	}
+	
+	// Configurar uma limpeza programada após algumas horas por segurança
+	go func() {
+		time.Sleep(1 * time.Hour)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		_, err := h.db.GetDB().ExecContext(ctx,
+			"DELETE FROM temp_payment_data WHERE checkout_id = ?",
+			checkoutID)
+		
+		if err != nil {
+			log.Printf("Error cleaning up temporary payment data: %v", err)
+		}
+	}()
+	
+	utils.SendSuccessResponse(w, models.APIResponse{
+		Status:  "success",
+		Message: "Payment data stored temporarily",
+	})
 }

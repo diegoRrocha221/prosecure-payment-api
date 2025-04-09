@@ -62,7 +62,7 @@ func Load() *Config {
     if maxAge == 0 {
         maxAge = 2400 // Default to 2400 if not set
     }
-    workerConcurrency := 2
+    workerConcurrency := 4
     cfg := &Config{
         Database: database.DatabaseConfig{
             Host:     os.Getenv("DB_HOST"),

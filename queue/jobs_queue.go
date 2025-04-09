@@ -10,15 +10,15 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
-// JobType defines the type of background job
 type JobType string
 
 const (
 	JobTypeVoidTransaction   JobType = "void_transaction"
 	JobTypeCreateSubscription JobType = "create_subscription"
+	JobTypeProcessPayment     JobType = "process_payment"     
+	JobTypeCreateAccount      JobType = "create_account"       
 )
 
-// Job represents a background job
 type Job struct {
 	ID         string                 `json:"id"`
 	Type       JobType               `json:"type"`
@@ -27,7 +27,6 @@ type Job struct {
 	RetryCount int                   `json:"retry_count"`
 }
 
-// Queue represents a Redis-backed job queue
 type Queue struct {
 	client     *redis.Client
 	queueName  string
@@ -35,7 +34,6 @@ type Queue struct {
 	failed     string
 }
 
-// NewQueue creates a new Redis queue
 func NewQueue(redisURL, queueName string) (*Queue, error) {
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
@@ -46,7 +44,6 @@ func NewQueue(redisURL, queueName string) (*Queue, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Test connection
 	if err := client.Ping(ctx).Err(); err != nil {
 		return nil, fmt.Errorf("failed to connect to Redis: %v", err)
 	}
@@ -59,7 +56,6 @@ func NewQueue(redisURL, queueName string) (*Queue, error) {
 	}, nil
 }
 
-// Enqueue adds a job to the queue
 func (q *Queue) Enqueue(ctx context.Context, jobType JobType, data map[string]interface{}) error {
 	job := Job{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
@@ -82,13 +78,12 @@ func (q *Queue) Enqueue(ctx context.Context, jobType JobType, data map[string]in
 	return nil
 }
 
-// Dequeue gets a job from the queue
+
 func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error) {
-	// Use BLPOP to wait for a job with a timeout
 	result, err := q.client.BLPop(ctx, timeout, q.queueName).Result()
 	if err != nil {
 		if err == redis.Nil {
-			return nil, nil // No jobs available
+			return nil, nil 
 		}
 		return nil, fmt.Errorf("failed to get job from queue: %v", err)
 	}
@@ -102,7 +97,6 @@ func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error
 		return nil, fmt.Errorf("failed to unmarshal job: %v", err)
 	}
 
-	// Move to processing queue
 	err = q.client.RPush(ctx, q.processing, result[1]).Err()
 	if err != nil {
 		log.Printf("Warning: Failed to move job %s to processing queue: %v", job.ID, err)
@@ -111,7 +105,6 @@ func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error
 	return &job, nil
 }
 
-// CompleteJob marks a job as completed by removing it from the processing queue
 func (q *Queue) CompleteJob(ctx context.Context, job *Job) error {
 	jobJSON, err := json.Marshal(job)
 	if err != nil {
@@ -127,15 +120,12 @@ func (q *Queue) CompleteJob(ctx context.Context, job *Job) error {
 	return nil
 }
 
-// FailJob handles job failure with retry logic
 func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 	job.RetryCount++
 	
-	// Add error information to the job
 	job.Data["last_error"] = err.Error()
 	job.Data["failed_at"] = time.Now()
 
-	// Define max retries
 	const maxRetries = 5
 	
 	jobJSON, marshalErr := json.Marshal(job)
@@ -143,15 +133,11 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 		return fmt.Errorf("failed to marshal job: %v", marshalErr)
 	}
 
-	// Remove from processing queue
 	if err := q.client.LRem(ctx, q.processing, 1, jobJSON).Err(); err != nil {
 		log.Printf("Warning: Failed to remove job %s from processing queue: %v", job.ID, err)
 	}
 	
-	// If we haven't reached max retries, put it back in the main queue with a delay
 	if job.RetryCount <= maxRetries {
-		// Calculate exponential backoff delay
-		// Base delay of 15 seconds with exponential increase (15s, 30s, 1m, 2m, 4m)
 		delaySeconds := 15 * (1 << (job.RetryCount - 1))
 		retryTime := time.Now().Add(time.Duration(delaySeconds) * time.Second)
 		
@@ -159,7 +145,6 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 		
 		updatedJobJSON, _ := json.Marshal(job)
 		
-		// Use Redis ZADD with score as timestamp for delayed processing
 		delayedQueueName := q.queueName + ":delayed"
 		score := float64(retryTime.Unix())
 		
@@ -168,7 +153,6 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 			Member: updatedJobJSON,
 		}).Err(); err != nil {
 			log.Printf("Warning: Failed to add job to delayed queue, adding to failed queue: %v", err)
-			// Fall back to failed queue
 			if err := q.client.RPush(ctx, q.failed, updatedJobJSON).Err(); err != nil {
 				return fmt.Errorf("failed to push job to failed queue: %v", err)
 			}
@@ -179,7 +163,6 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 		return nil
 	}
 	
-	// If max retries exceeded, move to failed queue
 	if err := q.client.RPush(ctx, q.failed, jobJSON).Err(); err != nil {
 		return fmt.Errorf("failed to push job to failed queue: %v", err)
 	}
@@ -188,12 +171,10 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 	return nil
 }
 
-// ProcessDelayedJobs moves jobs from the delayed queue to the main queue when they're ready
 func (q *Queue) ProcessDelayedJobs(ctx context.Context) error {
 	delayedQueueName := q.queueName + ":delayed"
 	now := float64(time.Now().Unix())
 	
-	// Find all jobs that are ready to be processed (score <= current time)
 	jobs, err := q.client.ZRangeByScore(ctx, delayedQueueName, &redis.ZRangeBy{
 		Min: "0",
 		Max: fmt.Sprintf("%f", now),
@@ -204,13 +185,11 @@ func (q *Queue) ProcessDelayedJobs(ctx context.Context) error {
 	}
 	
 	for _, jobJSON := range jobs {
-		// Move to main queue
 		if err := q.client.RPush(ctx, q.queueName, jobJSON).Err(); err != nil {
 			log.Printf("Warning: Failed to move delayed job to main queue: %v", err)
 			continue
 		}
 		
-		// Remove from delayed queue
 		if err := q.client.ZRem(ctx, delayedQueueName, jobJSON).Err(); err != nil {
 			log.Printf("Warning: Failed to remove job from delayed queue: %v", err)
 			continue
@@ -229,9 +208,7 @@ func (q *Queue) ProcessDelayedJobs(ctx context.Context) error {
 	return nil
 }
 
-// RetryJob moves a job back to the main queue for retry
 func (q *Queue) RetryJob(ctx context.Context, jobID string) error {
-	// Find job in failed queue
 	jobs, err := q.client.LRange(ctx, q.failed, 0, -1).Result()
 	if err != nil {
 		return fmt.Errorf("failed to list failed jobs: %v", err)
@@ -245,12 +222,10 @@ func (q *Queue) RetryJob(ctx context.Context, jobID string) error {
 		}
 
 		if job.ID == jobID {
-			// Remove from failed queue
 			if err := q.client.LRem(ctx, q.failed, 1, jobJSON).Err(); err != nil {
 				return fmt.Errorf("failed to remove job from failed queue: %v", err)
 			}
 
-			// Add back to main queue
 			if err := q.client.RPush(ctx, q.queueName, jobJSON).Err(); err != nil {
 				return fmt.Errorf("failed to push job to main queue: %v", err)
 			}
@@ -263,12 +238,10 @@ func (q *Queue) RetryJob(ctx context.Context, jobID string) error {
 	return fmt.Errorf("job %s not found in failed queue", jobID)
 }
 
-// Client returns the underlying Redis client for health checks
 func (q *Queue) Client() *redis.Client {
 	return q.client
 }
 
-// Close closes the Redis connection
 func (q *Queue) Close() error {
 	return q.client.Close()
 }

@@ -137,7 +137,8 @@ func main() {
         workerConcurrency = 8 // Limitar para evitar sobrecarga
     }
     
-    paymentWorker := worker.NewWorker(jobQueue, db, paymentService)
+    // Criar worker com serviços completos para processamento assíncrono
+    paymentWorker := worker.NewWorker(jobQueue, db, paymentService, emailService)
     paymentWorker.Start(workerConcurrency)
     defer paymentWorker.Stop()
     log.Printf("Started payment worker with %d threads", workerConcurrency)
@@ -172,12 +173,13 @@ func main() {
     
     // Payment processing endpoints
     api.HandleFunc("/process-payment", paymentHandler.ProcessPayment).Methods("POST", "OPTIONS")
+    api.HandleFunc("/check-payment-status", paymentHandler.CheckPaymentStatus).Methods("GET", "OPTIONS") // Novo endpoint para checagem assíncrona
     api.HandleFunc("/reset-checkout-status", paymentHandler.ResetCheckoutStatus).Methods("POST", "OPTIONS")
     api.HandleFunc("/generate-checkout-id", paymentHandler.GenerateCheckoutID).Methods("GET")
     api.HandleFunc("/update-checkout-id", paymentHandler.UpdateCheckoutID).Methods("POST")
     api.HandleFunc("/check-checkout-status", paymentHandler.CheckCheckoutStatus).Methods("GET")
     
-    // Webhook endpoints - Configuração das rotas de webhook
+    // Webhook endpoints
     webhookRouter := api.PathPrefix("/authorize-net/webhook").Subrouter()
     webhookRouter.HandleFunc("/silent-post", webhookHandler.HandleSilentPost).Methods("POST")
     webhookRouter.HandleFunc("/relay-response", webhookHandler.HandleRelayResponse).Methods("POST")
@@ -194,6 +196,7 @@ func main() {
     api.HandleFunc("/cart", cartHandler.UpdateCart).Methods("PUT", "OPTIONS")
     api.HandleFunc("/cart", cartHandler.GetCart).Methods("GET", "OPTIONS")
     api.HandleFunc("/cart/remove", cartHandler.RemoveFromCart).Methods("POST", "OPTIONS")
+
     // Registrar hora de início para cálculo de uptime
     startTime := time.Now()
     
@@ -268,11 +271,12 @@ func main() {
     log.Println("Shutdown signal received, gracefully shutting down...")
 
     // Criar contexto com timeout para encerramento
-
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer shutdownCancel()
 
     // Primeiro encerrar o HTTP server
     log.Println("Shutting down HTTP server...")
-    if err := srv.Shutdown(ctx); err != nil {
+    if err := srv.Shutdown(shutdownCtx); err != nil {
         log.Printf("Server forced to shutdown: %v", err)
     }
 
