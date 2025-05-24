@@ -75,7 +75,7 @@ func sendSuccessResponse(w http.ResponseWriter, response models.APIResponse) {
 
 func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
     requestID := uuid.New().String()
-    startTime := time.Now()
+    //startTime := time.Now()
     log.Printf("[RequestID: %s] Starting payment processing", requestID)
 
     var req models.PaymentRequest
@@ -154,13 +154,14 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         Country:     "US",
         PhoneNumber: checkout.PhoneNumber,
     }
-
+		// DESABILITADO: Validação do cartão
+    /*
     if !h.paymentService.ValidateCard(&req) {
         log.Printf("[RequestID: %s] Invalid card data", requestID)
         sendErrorResponse(w, http.StatusBadRequest, "Dados do cartão inválidos: verifique o número, data de validade e código de segurança")
         return
     }
-
+		*/
     ctxTemp, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     
@@ -191,7 +192,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     if err != nil {
         log.Printf("[RequestID: %s] Warning: Failed to store initial payment status: %v", requestID, err)
     }
-
+		/*
     ctx := context.Background()
     err = h.queue.Enqueue(ctx, queue.JobTypeProcessPayment, map[string]interface{}{
         "checkout_id": checkout.ID,
@@ -213,6 +214,43 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
             "request_id":  requestID,
             "checkout_id": checkout.ID,
             "status_url": fmt.Sprintf("/api/check-payment-status?request_id=%s", requestID),
+        },
+    })
+		*/
+		transactionID := fmt.Sprintf("TEST-%s", uuid.New().String())
+    
+    // Atualizar o status de pagamento para sucesso
+    _, err = h.db.GetDB().ExecContext(ctxTemp,
+        `INSERT INTO payment_results 
+         (request_id, checkout_id, status, transaction_id, created_at)
+         VALUES (?, ?, 'success', ?, NOW())
+         ON DUPLICATE KEY UPDATE
+         status = 'success',
+         transaction_id = ?,
+         created_at = NOW()`,
+        requestID, checkout.ID, transactionID, transactionID)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Error updating payment status: %v", requestID, err)
+    }
+    
+    // Criar a conta diretamente, sem processar pagamento real
+    err = h.createAccountsAndNotify(checkout, &req, transactionID)
+    if err != nil {
+        log.Printf("[RequestID: %s] Error creating account: %v", requestID, err)
+        sendErrorResponse(w, http.StatusInternalServerError, "Falha ao criar conta")
+        return
+    }
+    
+    log.Printf("[RequestID: %s] Account created successfully with test transaction ID: %s", requestID, transactionID)
+
+    sendSuccessResponse(w, models.APIResponse{
+        Status:  "success",
+        Message: "Processamento concluído com sucesso",
+        Data: map[string]interface{}{
+            "request_id":  requestID,
+            "checkout_id": checkout.ID,
+            "transaction_id": transactionID,
         },
     })
 }
@@ -497,7 +535,6 @@ func (h *PaymentHandler) generateInvoiceEmail(checkout *models.CheckoutData) str
     totalsSection := fmt.Sprintf(`
         <p><strong>Subtotal:</strong> $%.2f</p>
         <p><strong>Discount:</strong> $%.2f</p>
-        <p><strong>Tax validation card (refunded):</strong> $0.01</p>
         <p><strong>Total:</strong> $0.01</p>
     `, total, total-0.01)
 
