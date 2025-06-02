@@ -13,10 +13,11 @@ import (
 type JobType string
 
 const (
-	JobTypeVoidTransaction   JobType = "void_transaction"
+	JobTypeVoidTransaction    JobType = "void_transaction"
 	JobTypeCreateSubscription JobType = "create_subscription"
 	JobTypeProcessPayment     JobType = "process_payment"     
-	JobTypeCreateAccount      JobType = "create_account"       
+	JobTypeCreateAccount      JobType = "create_account"
+	JobTypeDelayedPayment     JobType = "delayed_payment"     // Novo tipo para pagamento com delay
 )
 
 type Job struct {
@@ -78,6 +79,39 @@ func (q *Queue) Enqueue(ctx context.Context, jobType JobType, data map[string]in
 	return nil
 }
 
+// EnqueueDelayed adiciona um job para ser processado após um delay específico
+func (q *Queue) EnqueueDelayed(ctx context.Context, jobType JobType, data map[string]interface{}, delay time.Duration) error {
+	job := Job{
+		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+		Type:      jobType,
+		Data:      data,
+		CreatedAt: time.Now(),
+	}
+
+	jobJSON, err := json.Marshal(job)
+	if err != nil {
+		return fmt.Errorf("failed to marshal job: %v", err)
+	}
+
+	// Calcular quando o job deve ser processado
+	executeAt := time.Now().Add(delay)
+	score := float64(executeAt.Unix())
+
+	// Adicionar ao sorted set com score sendo o timestamp de execução
+	delayedQueueName := q.queueName + ":delayed"
+	err = q.client.ZAdd(ctx, delayedQueueName, &redis.Z{
+		Score:  score,
+		Member: jobJSON,
+	}).Err()
+
+	if err != nil {
+		return fmt.Errorf("failed to push delayed job to queue: %v", err)
+	}
+
+	log.Printf("Enqueued delayed job %s of type %s to execute at %s", 
+		job.ID, job.Type, executeAt.Format("2006-01-02 15:04:05"))
+	return nil
+}
 
 func (q *Queue) Dequeue(ctx context.Context, timeout time.Duration) (*Job, error) {
 	result, err := q.client.BLPop(ctx, timeout, q.queueName).Result()
@@ -201,8 +235,8 @@ func (q *Queue) ProcessDelayedJobs(ctx context.Context) error {
 			continue
 		}
 		
-		log.Printf("Moved delayed job %s of type %s to main queue for retry %d", 
-			job.ID, job.Type, job.RetryCount)
+		log.Printf("Moved delayed job %s of type %s to main queue for processing", 
+			job.ID, job.Type)
 	}
 	
 	return nil

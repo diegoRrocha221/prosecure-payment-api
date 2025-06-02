@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"strings"
-	"sync"
 	"time"
 
 	"prosecure-payment-api/config"
@@ -216,7 +215,7 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     
     if err != nil {
         log.Printf("[RequestID: %s] Failed to retrieve payment data: %v", requestID, err)
-        return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired")
+        return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired", true) // enviar email
     }
     
     // Criar objeto de requisição de pagamento
@@ -243,18 +242,48 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         }
     }
     
-    // ETAPA 1: Processar transação teste de $1
+    // ETAPA 1: Processar transação teste de $1 (com tentativas)
     log.Printf("[RequestID: %s] Step 1: Processing test transaction", requestID)
     
-    resp, err := w.paymentService.ProcessInitialAuthorization(paymentReq)
-    if err != nil {
-        log.Printf("[RequestID: %s] Test transaction failed: %v", requestID, err)
-        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Test transaction failed: %v", err))
+    var resp *models.TransactionResponse
+    var transactionErr error
+    maxAttempts := 3
+    
+    for attempt := 1; attempt <= maxAttempts; attempt++ {
+        if attempt > 1 {
+            log.Printf("[RequestID: %s] Retry test transaction attempt %d/%d", requestID, attempt, maxAttempts)
+            time.Sleep(time.Duration(attempt) * time.Second) // 1s, 2s, 3s
+        }
+        
+        resp, transactionErr = w.paymentService.ProcessInitialAuthorization(paymentReq)
+        if transactionErr == nil && resp != nil && resp.Success {
+            break // Sucesso!
+        }
+        
+        // Log do erro da tentativa
+        if transactionErr != nil {
+            log.Printf("[RequestID: %s] Test transaction attempt %d failed: %v", requestID, attempt, transactionErr)
+        } else if resp != nil {
+            log.Printf("[RequestID: %s] Test transaction attempt %d declined: %s", requestID, attempt, resp.Message)
+        }
+        
+        // Se não é a última tentativa, não envia email ainda
+        if attempt < maxAttempts {
+            continue
+        }
     }
     
-    if !resp.Success {
-        log.Printf("[RequestID: %s] Test transaction declined: %s", requestID, resp.Message)
-        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Test transaction declined: %s", resp.Message))
+    // Verificar se todas as tentativas falharam
+    if transactionErr != nil || resp == nil || !resp.Success {
+        finalError := "Test transaction failed after all attempts"
+        if transactionErr != nil {
+            finalError = fmt.Sprintf("Test transaction failed: %v", transactionErr)
+        } else if resp != nil {
+            finalError = fmt.Sprintf("Test transaction declined: %s", resp.Message)
+        }
+        
+        log.Printf("[RequestID: %s] All test transaction attempts failed", requestID)
+        return w.handlePaymentFailure(checkout, requestID, finalError, true) // true = enviar email
     }
     
     transactionID := resp.TransactionID
@@ -263,10 +292,10 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     // ETAPA 2: Fazer VOID da transação teste
     log.Printf("[RequestID: %s] Step 2: Voiding test transaction", requestID)
     
-    err = w.paymentService.VoidTransaction(transactionID)
-    if err != nil {
-        log.Printf("[RequestID: %s] Failed to void test transaction: %v", requestID, err)
-        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to void test transaction: %v", err))
+    voidErr := w.paymentService.VoidTransaction(transactionID)
+    if voidErr != nil {
+        log.Printf("[RequestID: %s] Failed to void test transaction: %v", requestID, voidErr)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to void test transaction: %v", voidErr), true) // enviar email
     }
     
     log.Printf("[RequestID: %s] Test transaction voided successfully", requestID)
@@ -274,10 +303,10 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     // ETAPA 3: Criar ARB (assinatura recorrente)
     log.Printf("[RequestID: %s] Step 3: Creating subscription (ARB)", requestID)
     
-    err = w.paymentService.SetupRecurringBilling(paymentReq, checkout)
-    if err != nil {
-        log.Printf("[RequestID: %s] Failed to setup subscription: %v", requestID, err)
-        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", err))
+    subscriptionErr := w.paymentService.SetupRecurringBilling(paymentReq, checkout)
+    if subscriptionErr != nil {
+        log.Printf("[RequestID: %s] Failed to setup subscription: %v", requestID, subscriptionErr)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", subscriptionErr), true) // enviar email
     }
     
     log.Printf("[RequestID: %s] Subscription created successfully", requestID)
@@ -287,29 +316,29 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     
     // Buscar o master_reference da conta que já foi criada
     var masterRef string
-    err = w.db.GetDB().QueryRowContext(ctx, 
+    masterErr := w.db.GetDB().QueryRowContext(ctx, 
         `SELECT reference_uuid FROM master_accounts 
          WHERE username = ? AND email = ? LIMIT 1`,
         checkout.Username, checkout.Email).Scan(&masterRef)
     
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, err)
+    if masterErr != nil {
+        log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, masterErr)
         // Mesmo assim, considera sucesso pois o pagamento funcionou
     } else {
         // Atualizar a transação pendente com o ID real
-        _, err = w.db.GetDB().ExecContext(ctx,
+        _, updateErr := w.db.GetDB().ExecContext(ctx,
             `UPDATE transactions 
              SET transaction_id = ?, status = 'authorized', updated_at = NOW()
              WHERE master_reference = ? AND transaction_id = 'PENDING'`,
             transactionID, masterRef)
         
-        if err != nil {
-            log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, err)
+        if updateErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, updateErr)
         }
     }
     
     // Atualizar status do pagamento para sucesso
-    _, err = w.db.GetDB().ExecContext(ctx,
+    _, statusErr := w.db.GetDB().ExecContext(ctx,
         `INSERT INTO payment_results 
          (request_id, checkout_id, status, transaction_id, created_at)
          VALUES (?, ?, 'success', ?, NOW())
@@ -319,32 +348,49 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
          created_at = NOW()`,
         requestID, checkoutID, transactionID, transactionID)
     
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, err)
+    if statusErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
     }
     
     // Limpar dados de cartão temporários
-    _, err = w.db.GetDB().ExecContext(ctx,
+    _, cleanupErr := w.db.GetDB().ExecContext(ctx,
         "DELETE FROM temp_payment_data WHERE checkout_id = ?",
         checkoutID)
     
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, err)
+    if cleanupErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
+    }
+    
+    // ETAPA 5: ENVIAR EMAIL DE INVOICE (apenas após sucesso completo)
+    log.Printf("[RequestID: %s] Step 5: Sending invoice email after successful payment processing", requestID)
+    
+    invoiceEmailContent := w.generateInvoiceEmail(checkout)
+    emailErr := w.emailService.SendEmail(
+        checkout.Email,
+        "Your invoice has been delivered :)",
+        invoiceEmailContent,
+    )
+    
+    if emailErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to send invoice email: %v", requestID, emailErr)
+        // Não falha o processo por causa do email - pagamento já foi processado com sucesso
+    } else {
+        log.Printf("[RequestID: %s] Invoice email sent successfully to %s", requestID, checkout.Email)
     }
     
     log.Printf("[RequestID: %s] Delayed payment processing completed successfully", requestID)
     return nil
 }
 
-// handlePaymentFailure - Trata falhas de pagamento enviando email e marcando usuário como inativo
-func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, errorMsg string) error {
-    log.Printf("[RequestID: %s] Handling payment failure for %s: %s", requestID, checkout.Email, errorMsg)
+// handlePaymentFailure - Trata falhas de pagamento, enviando email apenas se sendEmail = true
+func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, errorMsg string, sendEmail bool) error {
+    log.Printf("[RequestID: %s] Handling payment failure for %s: %s (sendEmail: %v)", requestID, checkout.Email, errorMsg, sendEmail)
     
     // Atualizar status do pagamento para falha
     ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     
-    _, err := w.db.GetDB().ExecContext(ctx,
+    _, dbErr := w.db.GetDB().ExecContext(ctx,
         `INSERT INTO payment_results 
          (request_id, checkout_id, status, error_message, created_at)
          VALUES (?, ?, 'failed', ?, NOW())
@@ -354,39 +400,43 @@ func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, 
          created_at = NOW()`,
         requestID, checkout.ID, errorMsg, errorMsg)
     
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to update payment failure status: %v", requestID, err)
+    if dbErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to update payment failure status: %v", requestID, dbErr)
     }
     
     // Marcar usuário como inativo (is_active = 9) se existir
-    err = w.db.MarkUserInactive(checkout.Email, checkout.Username)
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to mark user inactive: %v", requestID, err)
+    markErr := w.db.MarkUserInactive(checkout.Email, checkout.Username)
+    if markErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to mark user inactive: %v", requestID, markErr)
     }
     
-    // Enviar email de notificação de falha
-    failureEmailContent := w.generatePaymentFailureEmail(checkout.Name, errorMsg)
-    
-    err = w.emailService.SendEmail(
-        checkout.Email,
-        "Payment Processing Issue - Action Required",
-        failureEmailContent,
-    )
-    
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to send failure email: %v", requestID, err)
-        // Não retorna erro pois o importante é registrar a falha
+    // Enviar email de notificação de falha APENAS se solicitado
+    if sendEmail {
+        failureEmailContent := w.generatePaymentFailureEmail(checkout.Name, errorMsg)
+        
+        emailErr := w.emailService.SendEmail(
+            checkout.Email,
+            "Payment Processing Issue - Action Required",
+            failureEmailContent,
+        )
+        
+        if emailErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to send failure email: %v", requestID, emailErr)
+            // Não retorna erro pois o importante é registrar a falha
+        } else {
+            log.Printf("[RequestID: %s] Payment failure email sent to %s", requestID, checkout.Email)
+        }
     } else {
-        log.Printf("[RequestID: %s] Payment failure email sent to %s", requestID, checkout.Email)
+        log.Printf("[RequestID: %s] Skipping failure email (not final attempt)", requestID)
     }
     
     // Limpar dados de cartão temporários
-    _, err = w.db.GetDB().ExecContext(ctx,
+    _, cleanupErr := w.db.GetDB().ExecContext(ctx,
         "DELETE FROM temp_payment_data WHERE checkout_id = ?",
         checkout.ID)
     
-    if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, err)
+    if cleanupErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
     }
     
     // Retorna o erro original para que seja registrado no job
@@ -816,8 +866,9 @@ func (w *Worker) createAccountsAndNotify(checkout *models.CheckoutData, cardData
     encodedCode := base64.StdEncoding.EncodeToString([]byte(code))
 
     // Atualizar código de ativação no DB
-    if err := w.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code); err != nil {
-        log.Printf("Warning: Failed to update activation code: %v", err)
+    updateErr := w.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code)
+    if updateErr != nil {
+        log.Printf("Warning: Failed to update activation code: %v", updateErr)
         // Continue mesmo com erro - o usuário ainda poderá ativar de outras formas
     }
 
@@ -827,49 +878,24 @@ func (w *Worker) createAccountsAndNotify(checkout *models.CheckoutData, cardData
         encodedUser, encodedEmail, encodedCode,
     )
 
-    // Preparar conteúdo dos emails
+    // Preparar e enviar APENAS email de ativação
     activationEmailContent := w.generateActivationEmail(checkout.Name, activationURL)
-    invoiceEmailContent := w.generateInvoiceEmail(checkout)
-
-    // Enviar emails em paralelo
-    var wg sync.WaitGroup
-    var emailErrors []error
 
     // Enviar email de ativação
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        if err := w.emailService.SendEmail(
-            checkout.Email,
-            "Please Confirm Your Email Address",
-            activationEmailContent,
-        ); err != nil {
-            log.Printf("Warning: Failed to send activation email: %v", err)
-            emailErrors = append(emailErrors, err)
-        }
-    }()
-
-    // Enviar email de fatura
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        if err := w.emailService.SendEmail(
-            checkout.Email,
-            "Your invoice has been delivered :)",
-            invoiceEmailContent,
-        ); err != nil {
-            log.Printf("Warning: Failed to send invoice email: %v", err)
-            emailErrors = append(emailErrors, err)
-        }
-    }()
-
-    // Aguardar todos os emails serem enviados
-    wg.Wait()
-
-    // Se houver erros nos emails, retornar o primeiro
-    if len(emailErrors) > 0 {
-        return fmt.Errorf("email notification error: %v", emailErrors[0])
+    activationErr := w.emailService.SendEmail(
+        checkout.Email,
+        "Please Confirm Your Email Address",
+        activationEmailContent,
+    )
+    
+    if activationErr != nil {
+        log.Printf("Warning: Failed to send activation email: %v", activationErr)
+        // Continua mesmo com erro no email - conta já foi criada
+    } else {
+        log.Printf("Activation email sent successfully to %s", checkout.Email)
     }
+    
+    // NOTA: Email de invoice será enviado apenas após sucesso completo do pagamento no processDelayedPaymentJob
 
     log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
     return nil

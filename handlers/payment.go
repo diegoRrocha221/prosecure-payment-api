@@ -9,7 +9,6 @@ import (
     "log"
     "net/http"
     "strings"
-    "sync"
     "time"
     
     "github.com/google/uuid"
@@ -32,7 +31,7 @@ type PaymentHandler struct {
     paymentService *payment.Service
     emailService   *email.SMTPService
     queue          *queue.Queue
-    checkoutCache  sync.Map 
+    checkoutCache  map[string]checkoutCache // Changed from sync.Map to regular map
 }
 
 func NewPaymentHandler(db *database.Connection, ps *payment.Service, es *email.SMTPService, q *queue.Queue) (*PaymentHandler, error) {
@@ -54,7 +53,7 @@ func NewPaymentHandler(db *database.Connection, ps *payment.Service, es *email.S
         paymentService: ps,
         emailService:   es,
         queue:          q,
-        checkoutCache:  sync.Map{},
+        checkoutCache:  make(map[string]checkoutCache),
     }, nil
 }
 
@@ -120,10 +119,9 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     
     // Buscar dados do checkout (usar cache se disponível)
     var checkout *models.CheckoutData
-    if cachedData, found := h.checkoutCache.Load(req.CheckoutID); found {
-        cache := cachedData.(checkoutCache)
-        if time.Since(cache.timestamp) < 5*time.Minute {
-            checkout = cache.data
+    if cachedData, found := h.checkoutCache[req.CheckoutID]; found {
+        if time.Since(cachedData.timestamp) < 5*time.Minute {
+            checkout = cachedData.data
             log.Printf("[RequestID: %s] Using cached checkout data", requestID)
         }
     }
@@ -138,10 +136,10 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
             return
         }
         
-        h.checkoutCache.Store(req.CheckoutID, checkoutCache{
+        h.checkoutCache[req.CheckoutID] = checkoutCache{
             data:      checkout,
             timestamp: time.Now(),
-        })
+        }
     }
 
     // Adicionar informações de billing ao request
@@ -199,11 +197,6 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
 
     // CRIAR CONTA IMEDIATAMENTE para uso do cliente
     log.Printf("[RequestID: %s] Creating user account immediately", requestID)
-    
-    cardData := &models.CardData{
-        Number: req.CardNumber,
-        Expiry: req.Expiry,
-    }
     
     err = h.createAccountsAndNotify(checkout, &req, "PENDING")
     if err != nil {
@@ -436,8 +429,9 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
     encodedCode := base64.StdEncoding.EncodeToString([]byte(code))
 
     go func() {
-        if err := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code); err != nil {
-            log.Printf("Warning: Failed to update activation code: %v", err)
+        updateErr := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code)
+        if updateErr != nil {
+            log.Printf("Warning: Failed to update activation code: %v", updateErr)
         }
     }()
 
@@ -447,49 +441,24 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         encodedUser, encodedEmail, encodedCode,
     )
 
-    // Preparar conteúdo dos emails
+    // Preparar e enviar APENAS email de ativação
     activationEmailContent := h.generateActivationEmail(checkout.Name, activationURL)
-    invoiceEmailContent := h.generateInvoiceEmail(checkout)
-
-    // Enviar emails em paralelo
-    var wg sync.WaitGroup
-    var emailErrors []error
 
     // Enviar email de ativação
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        if err := h.emailService.SendEmail(
-            checkout.Email,
-            "Please Confirm Your Email Address",
-            activationEmailContent,
-        ); err != nil {
-            log.Printf("Warning: Failed to send activation email: %v", err)
-            emailErrors = append(emailErrors, err)
-        }
-    }()
-
-    // Enviar email de fatura
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        if err := h.emailService.SendEmail(
-            checkout.Email,
-            "Your invoice has been delivered :)",
-            invoiceEmailContent,
-        ); err != nil {
-            log.Printf("Warning: Failed to send invoice email: %v", err)
-            emailErrors = append(emailErrors, err)
-        }
-    }()
-
-    // Aguardar todos os emails serem enviados
-    wg.Wait()
-
-    // Se houver erros nos emails, retornar o primeiro
-    if len(emailErrors) > 0 {
-        return fmt.Errorf("email notification error: %v", emailErrors[0])
+    activationErr := h.emailService.SendEmail(
+        checkout.Email,
+        "Please Confirm Your Email Address",
+        activationEmailContent,
+    )
+    
+    if activationErr != nil {
+        log.Printf("Warning: Failed to send activation email: %v", activationErr)
+        // Continua mesmo com erro no email - conta já foi criada
+    } else {
+        log.Printf("Activation email sent successfully to %s", checkout.Email)
     }
+    
+    // NOTA: Email de invoice será enviado apenas após sucesso completo do pagamento
 
     log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
     return nil
@@ -595,7 +564,7 @@ func (h *PaymentHandler) ResetCheckoutStatus(w http.ResponseWriter, r *http.Requ
     }
 
     // Remover do cache se existir
-    h.checkoutCache.Delete(req.CheckoutID)
+    delete(h.checkoutCache, req.CheckoutID)
 
     sendSuccessResponse(w, models.APIResponse{
         Status:  "success",
