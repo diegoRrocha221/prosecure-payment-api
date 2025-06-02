@@ -163,6 +163,9 @@ func main() {
     cartHandler := handlers.NewCartHandler(db, cfg)
     checkoutHandler := handlers.NewCheckoutHandler(db)
     linkAccountHandler := handlers.NewLinkAccountHandler(db, cfg)
+    
+    // NOVO: Inicializar handler de atualização de cartão
+    updateCardHandler := handlers.NewUpdateCardHandler(db, paymentService, emailService)
 
     // Configurar o router com middleware otimizados
     router := mux.NewRouter()
@@ -173,11 +176,16 @@ func main() {
     
     // Payment processing endpoints
     api.HandleFunc("/process-payment", paymentHandler.ProcessPayment).Methods("POST", "OPTIONS")
-    api.HandleFunc("/check-payment-status", paymentHandler.CheckPaymentStatus).Methods("GET", "OPTIONS") // Novo endpoint para checagem assíncrona
+    api.HandleFunc("/check-payment-status", paymentHandler.CheckPaymentStatus).Methods("GET", "OPTIONS")
     api.HandleFunc("/reset-checkout-status", paymentHandler.ResetCheckoutStatus).Methods("POST", "OPTIONS")
     api.HandleFunc("/generate-checkout-id", paymentHandler.GenerateCheckoutID).Methods("GET")
     api.HandleFunc("/update-checkout-id", paymentHandler.UpdateCheckoutID).Methods("POST")
     api.HandleFunc("/check-checkout-status", paymentHandler.CheckCheckoutStatus).Methods("GET")
+    
+    // NOVO: Card update endpoints
+    api.HandleFunc("/update-card", updateCardHandler.UpdateCard).Methods("POST", "OPTIONS")
+    api.HandleFunc("/check-account-status", updateCardHandler.CheckAccountStatus).Methods("GET", "OPTIONS")
+    api.HandleFunc("/card-update-history", updateCardHandler.GetCardUpdateHistory).Methods("GET", "OPTIONS")
     
     // Webhook endpoints
     webhookRouter := api.PathPrefix("/authorize-net/webhook").Subrouter()
