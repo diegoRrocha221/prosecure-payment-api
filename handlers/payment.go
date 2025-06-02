@@ -453,7 +453,7 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
     )
 
     // Preparar conteúdo dos emails
-    activationEmailContent := h.generateActivationEmail(checkout.Username, activationURL)
+    activationEmailContent := h.generateActivationEmail(checkout.Name, activationURL)
     invoiceEmailContent := h.generateInvoiceEmail(checkout)
 
     // Enviar emails em paralelo
@@ -501,41 +501,64 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
 }
 
 func (h *PaymentHandler) generateActivationEmail(username, activationURL string) string {
-    content := fmt.Sprintf(
-        "In order to activate your account, we need to confirm your email address. Once we do, "+
-            "you will be able to log into your Administrator Portal and begin setting up your devices "+
-            "on the most advanced security service on the planet.",
-    )
+    content := "In order to activate your account, we need to confirm your email address. Once we do, " +
+        "you will be able to log into your Administrator Portal and begin setting up your devices " +
+        "on the most advanced security service on the planet."
     
     footer := "Thank you so much,\nThe ProSecureLSP Team"
     
+    // Template corrigido com 5 argumentos: username, content, activationURL, activationURL (fallback), footer
     return fmt.Sprintf(
         email.ActivationEmailTemplate,
-        username,
-        content,
-        activationURL,
-        footer,
+        username,        // %s - Hi username!
+        content,         // %s - Conteúdo da mensagem
+        activationURL,   // %s - Link do botão
+        activationURL,   // %s - URL fallback
+        footer,          // %s - Footer message
     )
 }
 
+
 func (h *PaymentHandler) generateInvoiceEmail(checkout *models.CheckoutData) string {
     var total float64
-    plansTable := "<table><thead><tr><th>Plans</th><th>Price</th></tr></thead><tbody>"
+    
+    // Gerar tabela de planos de forma mais simples e robusta
+    plansTable := `<table class="plans-table">
+        <thead>
+            <tr>
+                <th>Plan Name</th>
+                <th>Price</th>
+            </tr>
+        </thead>
+        <tbody>`
     
     for _, plan := range checkout.Plans {
+        planPrice := plan.Price
         if plan.Annually == 1 {
             total += plan.Price * 10
+            planPrice = plan.Price * 10
         } else {
             total += plan.Price
         }
-        plansTable += fmt.Sprintf("<tr><td>%s</td><td>$%.2f</td></tr>", plan.PlanName, plan.Price)
+        
+        plansTable += fmt.Sprintf(`
+            <tr>
+                <td>%s</td>
+                <td>$%.2f</td>
+            </tr>`, 
+            plan.PlanName, 
+            planPrice,
+        )
     }
-    plansTable += "</tbody></table>"
+    plansTable += `
+        </tbody>
+    </table>`
 
+    // Seção de totais mais clara
     totalsSection := fmt.Sprintf(`
         <p><strong>Subtotal:</strong> $%.2f</p>
         <p><strong>Discount:</strong> $%.2f</p>
-        <p><strong>Total:</strong> $0.01</p>
+        <p style="font-size: 18px; font-weight: bold; color: #28a745;"><strong>Total Paid:</strong> $0.01</p>
     `, total, total-0.01)
 
     footer := fmt.Sprintf(
@@ -543,13 +566,17 @@ func (h *PaymentHandler) generateInvoiceEmail(checkout *models.CheckoutData) str
         checkout.Name,
     )
 
+    // Gerar número da invoice único
+    invoiceNumber := fmt.Sprintf("INV-%s", time.Now().Format("20060102-150405"))
+
+    // Template corrigido com 5 argumentos: invoiceNumber, plansTable, totalsSection, status, footer
     return fmt.Sprintf(
         email.InvoiceEmailTemplate,
-        time.Now().Format("20060102150405"),
-        plansTable,
-        totalsSection,
-        "Paid",
-        footer,
+        invoiceNumber,   // %s - Invoice number
+        plansTable,      // %s - Plans table HTML
+        totalsSection,   // %s - Totals section HTML
+        "Paid",          // %s - Status
+        footer,          // %s - Footer message
     )
 }
 

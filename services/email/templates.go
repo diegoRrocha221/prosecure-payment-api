@@ -13,8 +13,8 @@ const (
         
         /* Reset styles for email clients */
         body, table, td, p, a, li, blockquote {
-            -webkit-text-size-adjust: 100%;
-            -ms-text-size-adjust: 100%;
+            -webkit-text-size-adjust: 100%%;
+            -ms-text-size-adjust: 100%%;
         }
         
         table, td {
@@ -26,7 +26,7 @@ const (
             -ms-interpolation-mode: bicubic;
             border: 0;
             height: auto;
-            line-height: 100%;
+            line-height: 100%%;
             outline: none;
             text-decoration: none;
         }
@@ -34,8 +34,8 @@ const (
         /* Responsive styles */
         @media only screen and (max-width: 600px) {
             .container {
-                width: 100% !important;
-                max-width: 100% !important;
+                width: 100%% !important;
+                max-width: 100%% !important;
             }
             
             .content-padding {
@@ -47,7 +47,7 @@ const (
             }
             
             .mobile-full-width {
-                width: 100% !important;
+                width: 100%% !important;
                 display: block !important;
             }
         }
@@ -55,7 +55,7 @@ const (
 </head>
 <body style="margin: 0; padding: 0; background-color: #f9fafb; font-family: 'Inter', Arial, sans-serif;">
     <!-- Main Container -->
-    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f9fafb;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%" style="background-color: #f9fafb;">
         <tr>
             <td align="center" style="padding: 40px 20px;">
                 
@@ -74,10 +74,10 @@ const (
                         <td class="content-padding" style="padding: 48px 40px;">
                             
                             <!-- Welcome Section -->
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td style="text-align: center; padding-bottom: 32px;">
-                                        <div style="width: 64px; height: 64px; background-color: #dcfdf7; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 24px;">
+                                        <div style="width: 64px; height: 64px; background-color: #dcfdf7; border-radius: 50%%; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 24px;">
                                             <svg style="width: 32px; height: 32px; color: #157347;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 12a4 4 0 10-8 0 4 4 0 008 0zm0 0v1.5a2.5 2.5 0 005 0V12a9 9 0 10-9 9m4.5-1.206a8.959 8.959 0 01-4.5 1.207"></path>
                                             </svg>
@@ -93,7 +93,7 @@ const (
                             </table>
                             
                             <!-- Message Content -->
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td style="padding-bottom: 32px;">
                                         <h3 style="color: #25364D; font-size: 18px; font-weight: 600; margin: 0 0 16px 0;">
@@ -113,7 +113,7 @@ const (
                             </table>
                             
                             <!-- Action Button -->
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td style="text-align: center; padding: 32px 0;">
                                         <a href="%s" style="display: inline-block; background-color: #157347; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 16px; padding: 16px 32px; border-radius: 8px; transition: background-color 0.2s;">
@@ -124,7 +124,7 @@ const (
                             </table>
                             
                             <!-- Secondary Info -->
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td style="text-align: center; padding-top: 24px; border-top: 1px solid #e5e7eb;">
                                         <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px 0;">
@@ -143,7 +143,7 @@ const (
                     <!-- Footer -->
                     <tr>
                         <td style="background-color: #25364D; padding: 32px 40px; text-align: center;">
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td style="text-align: center; padding-bottom: 16px;">
                                         <p style="color: #9ca3af; font-size: 14px; margin: 0; line-height: 1.5;">
@@ -182,8 +182,8 @@ const (
         
         /* Reset styles for email clients */
         body, table, td, p, a, li, blockquote {
-            -webkit-text-size-adjust: 100%;
-            -ms-text-size-adjust: 100%;
+            -webkit-text-size-adjust: 100%%;
+            -ms-text-size-adjust: 100%%;
         }
         
         table, td {
@@ -195,14 +195,14 @@ const (
             -ms-interpolation-mode: bicubic;
             border: 0;
             height: auto;
-            line-height: 100%;
+            line-height: 100%%;
             outline: none;
             text-decoration: none;
         }
         
         /* Invoice specific styles */
         .invoice-table {
-            width: 100%;
+            width: 100%%;
             border-collapse: collapse;
             margin: 16px 0;
         }
@@ -230,8 +230,8 @@ const (
         /* Responsive styles */
         @media only screen and (max-width: 600px) {
             .container {
-                width: 100% !important;
-                max-width: 100% !important;
+                width: 100%% !important;
+                max-width: 100%% !important;
             }
             
             .content-padding {
@@ -243,7 +243,7 @@ const (
             }
             
             .mobile-full-width {
-                width: 100% !important;
+                width: 100%% !important;
                 display: block !important;
             }
             
@@ -257,7 +257,7 @@ const (
 </head>
 <body style="margin: 0; padding: 0; background-color: #f9fafb; font-family: 'Inter', Arial, sans-serif;">
     <!-- Main Container -->
-    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color: #f9fafb;">
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%" style="background-color: #f9fafb;">
         <tr>
             <td align="center" style="padding: 40px 20px;">
                 
@@ -274,7 +274,7 @@ const (
                     <!-- Invoice Header -->
                     <tr>
                         <td class="content-padding" style="padding: 32px 40px 16px 40px;">
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td>
                                         <h1 style="color: #25364D; font-size: 28px; font-weight: 700; margin: 0 0 8px 0; line-height: 1.2;">
@@ -355,10 +355,10 @@ const (
                     <!-- Footer -->
                     <tr>
                         <td style="background-color: #25364D; padding: 32px 40px; text-align: center;">
-                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                 <tr>
                                     <td style="text-align: center; padding-bottom: 16px;">
-                                        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                                        <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
                                             <tr>
                                                 <td style="text-align: center;">
                                                     <a href="https://prosecurelsp.com/contact.php" style="color: #9ca3af; text-decoration: none; font-size: 12px; margin: 0 8px;">
