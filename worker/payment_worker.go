@@ -99,7 +99,6 @@ func (w *Worker) processJobs(workerID int) {
 			log.Printf("Worker %d shutting down", workerID)
 			return
 		default:
-			// Reduzido timeout para melhorar responsividade
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			job, err := w.queue.Dequeue(ctx, 3*time.Second)
 			cancel()
@@ -131,7 +130,6 @@ func (w *Worker) processJobs(workerID int) {
 					log.Printf("Worker %d: Error marking job %s as failed: %v", workerID, job.ID, failErr)
 				}
 				
-				// Wait a bit after an error
 				time.Sleep(time.Second)
 				continue
 			}
@@ -159,9 +157,252 @@ func (w *Worker) processJob(job *queue.Job) error {
 		return w.processPaymentJob(job)
 	case queue.JobTypeCreateAccount:
 		return w.processCreateAccountJob(job)
+	case queue.JobTypeDelayedPayment:
+		return w.processDelayedPaymentJob(job) // Novo processador para pagamento com delay
 	default:
 		return fmt.Errorf("unknown job type: %s", job.Type)
 	}
+}
+
+// processDelayedPaymentJob - Processa apenas o PAGAMENTO (conta já foi criada)
+func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
+    checkoutID, ok := job.Data["checkout_id"].(string)
+    if !ok || checkoutID == "" {
+        return fmt.Errorf("invalid checkout_id in job data")
+    }
+    
+    requestID, _ := job.Data["request_id"].(string)
+    if requestID == "" {
+        requestID = job.ID
+    }
+    
+    log.Printf("[RequestID: %s] Processing delayed PAYMENT ONLY for checkout: %s (account already created)", requestID, checkoutID)
+    
+    // Verificar se o checkout já foi processado para pagamento
+    var paymentProcessed bool
+    err := w.db.GetDB().QueryRow(
+        `SELECT EXISTS(
+            SELECT 1 FROM payment_results 
+            WHERE checkout_id = ? AND status = 'success'
+        )`,
+        checkoutID).Scan(&paymentProcessed)
+    
+    if err != nil {
+        return fmt.Errorf("failed to check if payment is processed: %v", err)
+    }
+    
+    if paymentProcessed {
+        log.Printf("[RequestID: %s] Payment for checkout %s already processed, skipping", requestID, checkoutID)
+        return nil
+    }
+    
+    // Obter dados do checkout
+    checkout, err := w.db.GetCheckoutData(checkoutID)
+    if err != nil {
+        return fmt.Errorf("failed to get checkout data: %v", err)
+    }
+    
+    // Obter os dados do cartão armazenados temporariamente
+    var cardNumber, cardExpiry, cardCVV, cardName string
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    err = w.db.GetDB().QueryRowContext(ctx, 
+        `SELECT card_number, card_expiry, card_cvv, card_name 
+         FROM temp_payment_data 
+         WHERE checkout_id = ? 
+         AND created_at > NOW() - INTERVAL 2 HOUR`, // 2 horas para dar margem
+        checkoutID).Scan(&cardNumber, &cardExpiry, &cardCVV, &cardName)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Failed to retrieve payment data: %v", requestID, err)
+        return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired")
+    }
+    
+    // Criar objeto de requisição de pagamento
+    paymentReq := &models.PaymentRequest{
+        CardName:      cardName,
+        CardNumber:    cardNumber,
+        Expiry:        cardExpiry,
+        CVV:           cardCVV,
+        CheckoutID:    checkoutID,
+        CustomerEmail: checkout.Email,
+    }
+    
+    // Adicionar informações de billing
+    if checkout.Street != "" {
+        paymentReq.BillingInfo = &types.BillingInfoType{
+            FirstName:   strings.Split(checkout.Name, " ")[0],
+            LastName:    strings.Join(strings.Split(checkout.Name, " ")[1:], " "),
+            Address:     checkout.Street,
+            City:        checkout.City,
+            State:       checkout.State,
+            Zip:         checkout.ZipCode,
+            Country:     "US",
+            PhoneNumber: checkout.PhoneNumber,
+        }
+    }
+    
+    // ETAPA 1: Processar transação teste de $1
+    log.Printf("[RequestID: %s] Step 1: Processing test transaction", requestID)
+    
+    resp, err := w.paymentService.ProcessInitialAuthorization(paymentReq)
+    if err != nil {
+        log.Printf("[RequestID: %s] Test transaction failed: %v", requestID, err)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Test transaction failed: %v", err))
+    }
+    
+    if !resp.Success {
+        log.Printf("[RequestID: %s] Test transaction declined: %s", requestID, resp.Message)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Test transaction declined: %s", resp.Message))
+    }
+    
+    transactionID := resp.TransactionID
+    log.Printf("[RequestID: %s] Test transaction successful: %s", requestID, transactionID)
+    
+    // ETAPA 2: Fazer VOID da transação teste
+    log.Printf("[RequestID: %s] Step 2: Voiding test transaction", requestID)
+    
+    err = w.paymentService.VoidTransaction(transactionID)
+    if err != nil {
+        log.Printf("[RequestID: %s] Failed to void test transaction: %v", requestID, err)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to void test transaction: %v", err))
+    }
+    
+    log.Printf("[RequestID: %s] Test transaction voided successfully", requestID)
+    
+    // ETAPA 3: Criar ARB (assinatura recorrente)
+    log.Printf("[RequestID: %s] Step 3: Creating subscription (ARB)", requestID)
+    
+    err = w.paymentService.SetupRecurringBilling(paymentReq, checkout)
+    if err != nil {
+        log.Printf("[RequestID: %s] Failed to setup subscription: %v", requestID, err)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", err))
+    }
+    
+    log.Printf("[RequestID: %s] Subscription created successfully", requestID)
+    
+    // ETAPA 4: Atualizar transação no banco (já que a conta já existe)
+    log.Printf("[RequestID: %s] Step 4: Updating transaction record", requestID)
+    
+    // Buscar o master_reference da conta que já foi criada
+    var masterRef string
+    err = w.db.GetDB().QueryRowContext(ctx, 
+        `SELECT reference_uuid FROM master_accounts 
+         WHERE username = ? AND email = ? LIMIT 1`,
+        checkout.Username, checkout.Email).Scan(&masterRef)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, err)
+        // Mesmo assim, considera sucesso pois o pagamento funcionou
+    } else {
+        // Atualizar a transação pendente com o ID real
+        _, err = w.db.GetDB().ExecContext(ctx,
+            `UPDATE transactions 
+             SET transaction_id = ?, status = 'authorized', updated_at = NOW()
+             WHERE master_reference = ? AND transaction_id = 'PENDING'`,
+            transactionID, masterRef)
+        
+        if err != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, err)
+        }
+    }
+    
+    // Atualizar status do pagamento para sucesso
+    _, err = w.db.GetDB().ExecContext(ctx,
+        `INSERT INTO payment_results 
+         (request_id, checkout_id, status, transaction_id, created_at)
+         VALUES (?, ?, 'success', ?, NOW())
+         ON DUPLICATE KEY UPDATE
+         status = 'success',
+         transaction_id = ?,
+         created_at = NOW()`,
+        requestID, checkoutID, transactionID, transactionID)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, err)
+    }
+    
+    // Limpar dados de cartão temporários
+    _, err = w.db.GetDB().ExecContext(ctx,
+        "DELETE FROM temp_payment_data WHERE checkout_id = ?",
+        checkoutID)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, err)
+    }
+    
+    log.Printf("[RequestID: %s] Delayed payment processing completed successfully", requestID)
+    return nil
+}
+
+// handlePaymentFailure - Trata falhas de pagamento enviando email e marcando usuário como inativo
+func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, errorMsg string) error {
+    log.Printf("[RequestID: %s] Handling payment failure for %s: %s", requestID, checkout.Email, errorMsg)
+    
+    // Atualizar status do pagamento para falha
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    _, err := w.db.GetDB().ExecContext(ctx,
+        `INSERT INTO payment_results 
+         (request_id, checkout_id, status, error_message, created_at)
+         VALUES (?, ?, 'failed', ?, NOW())
+         ON DUPLICATE KEY UPDATE
+         status = 'failed',
+         error_message = ?,
+         created_at = NOW()`,
+        requestID, checkout.ID, errorMsg, errorMsg)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to update payment failure status: %v", requestID, err)
+    }
+    
+    // Marcar usuário como inativo (is_active = 9) se existir
+    err = w.db.MarkUserInactive(checkout.Email, checkout.Username)
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to mark user inactive: %v", requestID, err)
+    }
+    
+    // Enviar email de notificação de falha
+    failureEmailContent := w.generatePaymentFailureEmail(checkout.Name, errorMsg)
+    
+    err = w.emailService.SendEmail(
+        checkout.Email,
+        "Payment Processing Issue - Action Required",
+        failureEmailContent,
+    )
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to send failure email: %v", requestID, err)
+        // Não retorna erro pois o importante é registrar a falha
+    } else {
+        log.Printf("[RequestID: %s] Payment failure email sent to %s", requestID, checkout.Email)
+    }
+    
+    // Limpar dados de cartão temporários
+    _, err = w.db.GetDB().ExecContext(ctx,
+        "DELETE FROM temp_payment_data WHERE checkout_id = ?",
+        checkout.ID)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, err)
+    }
+    
+    // Retorna o erro original para que seja registrado no job
+    return fmt.Errorf("payment processing failed: %s", errorMsg)
+}
+
+// generatePaymentFailureEmail - Gera email de falha de pagamento
+func (w *Worker) generatePaymentFailureEmail(customerName, errorMessage string) string {
+    footer := "If you need assistance, please don't hesitate to contact our support team. We're here to help you get your ProSecureLSP account set up successfully."
+    
+    return fmt.Sprintf(
+        email.PaymentFailureEmailTemplate,
+        customerName,    // %s - Hi customerName!
+        errorMessage,    // %s - Descrição do erro
+        footer,          // %s - Footer message
+    )
 }
 
 // processVoidTransaction voids an authorized transaction
@@ -176,7 +417,7 @@ func (w *Worker) processVoidTransaction(job *queue.Job) error {
 	return w.paymentService.VoidTransaction(transactionID)
 }
 
-// processPaymentJob processa o pagamento de forma assíncrona
+// processPaymentJob processa o pagamento de forma assíncrona (método legado mantido para compatibilidade)
 func (w *Worker) processPaymentJob(job *queue.Job) error {
     checkoutID, ok := job.Data["checkout_id"].(string)
     if !ok || checkoutID == "" {
@@ -641,7 +882,6 @@ func (w *Worker) generateActivationEmail(username, activationURL string) string 
     
     footer := "Thank you so much,\nThe ProSecureLSP Team"
     
-    // Template corrigido com 5 argumentos: username, content, activationURL, activationURL (fallback), footer
     return fmt.Sprintf(
         email.ActivationEmailTemplate,
         username,        // %s - Hi username!
@@ -703,7 +943,6 @@ func (w *Worker) generateInvoiceEmail(checkout *models.CheckoutData) string {
     // Gerar número da invoice único
     invoiceNumber := fmt.Sprintf("INV-%s", time.Now().Format("20060102-150405"))
 
-    // Template corrigido com 5 argumentos: invoiceNumber, plansTable, totalsSection, status, footer
     return fmt.Sprintf(
         email.InvoiceEmailTemplate,
         invoiceNumber,   // %s - Invoice number

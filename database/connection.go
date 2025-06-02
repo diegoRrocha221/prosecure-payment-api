@@ -84,6 +84,7 @@ func (c *Connection) ReleaseLock(checkoutID string) error {
     
     return nil
 }
+
 func (c *Connection) ensureConnection() error {
     for retries := 0; retries < 3; retries++ {
         ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -268,6 +269,40 @@ func (c *Connection) UpdateUserActivationCode(email, username, code string) erro
     return nil
 }
 
+// MarkUserInactive marca um usuário como inativo (is_active = 9) para falhas de pagamento
+func (c *Connection) MarkUserInactive(email, username string) error {
+    if err := c.ensureConnection(); err != nil {
+        return fmt.Errorf("database connection check failed: %v", err)
+    }
+
+    log.Printf("Marking user inactive due to payment failure: %s", username)
+    
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    query := `UPDATE users SET is_active = 9 WHERE username = ? AND email = ?`
+   
+    result, err := c.db.ExecContext(ctx, query, username, email)
+    if err != nil {
+        log.Printf("Error marking user inactive: %v", err)
+        return fmt.Errorf("error marking user inactive: %v", err)
+    }
+
+    rowsAffected, err := result.RowsAffected()
+    if err != nil {
+        return fmt.Errorf("error getting rows affected: %v", err)
+    }
+
+    if rowsAffected == 0 {
+        log.Printf("Warning: No user found with username %s and email %s to mark inactive", username, email)
+        // Não retorna erro pois pode não existir ainda se o pagamento falhou antes da criação
+        return nil
+    }
+
+    log.Printf("Successfully marked user inactive: %s", username)
+    return nil
+}
+
 func (c *Connection) IsCheckoutProcessed(checkoutID string) (bool, error) {
 	var exists bool
 	query := `
@@ -286,6 +321,7 @@ func (c *Connection) IsCheckoutProcessed(checkoutID string) (bool, error) {
 	
 	return exists, nil
 }
+
 func (c *Connection) GetPlans() ([]models.PlanCart, error) {
 	query := `
 			SELECT id, image, name, description, price, rules, 

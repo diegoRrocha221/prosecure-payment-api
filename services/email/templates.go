@@ -395,4 +395,188 @@ const (
     </table>
 </body>
 </html>`
+
+    PaymentFailureEmailTemplate = `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Payment Issue - ProSecureLSP</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+        
+        /* Reset styles for email clients */
+        body, table, td, p, a, li, blockquote {
+            -webkit-text-size-adjust: 100%%;
+            -ms-text-size-adjust: 100%%;
+        }
+        
+        table, td {
+            mso-table-lspace: 0pt;
+            mso-table-rspace: 0pt;
+        }
+        
+        img {
+            -ms-interpolation-mode: bicubic;
+            border: 0;
+            height: auto;
+            line-height: 100%%;
+            outline: none;
+            text-decoration: none;
+        }
+        
+        /* Responsive styles */
+        @media only screen and (max-width: 600px) {
+            .container {
+                width: 100%% !important;
+                max-width: 100%% !important;
+            }
+            
+            .content-padding {
+                padding: 20px !important;
+            }
+            
+            .mobile-center {
+                text-align: center !important;
+            }
+            
+            .mobile-full-width {
+                width: 100%% !important;
+                display: block !important;
+            }
+        }
+    </style>
+</head>
+<body style="margin: 0; padding: 0; background-color: #f9fafb; font-family: 'Inter', Arial, sans-serif;">
+    <!-- Main Container -->
+    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%" style="background-color: #f9fafb;">
+        <tr>
+            <td align="center" style="padding: 40px 20px;">
+                
+                <!-- Email Content Container -->
+                <table role="presentation" class="container" cellspacing="0" cellpadding="0" border="0" width="600" style="max-width: 600px; background-color: #ffffff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); overflow: hidden;">
+                    
+                    <!-- Header -->
+                    <tr>
+                        <td style="background-color: #25364D; padding: 32px 20px; text-align: center;">
+                            <img src="https://prosecurelsp.com/images/logo.png" alt="ProSecureLSP Logo" style="height: 48px; width: auto; display: inline-block;">
+                        </td>
+                    </tr>
+                    
+                    <!-- Main Content -->
+                    <tr>
+                        <td class="content-padding" style="padding: 48px 40px;">
+                            
+                            <!-- Alert Section -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
+                                <tr>
+                                    <td style="text-align: center; padding-bottom: 32px;">
+                                        <div style="width: 64px; height: 64px; background-color: #fef2f2; border-radius: 50%%; display: inline-flex; align-items: center; justify-content: center; margin-bottom: 24px;">
+                                            <svg style="width: 32px; height: 32px; color: #dc2626;" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                            </svg>
+                                        </div>
+                                        <h1 style="color: #dc2626; font-size: 28px; font-weight: 700; margin: 0 0 8px 0; line-height: 1.2;">
+                                            Payment Processing Issue
+                                        </h1>
+                                        <p style="color: #6b7280; font-size: 16px; margin: 0; line-height: 1.5;">
+                                            Hi %s! We encountered an issue with your payment.
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                            
+                            <!-- Issue Details -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
+                                <tr>
+                                    <td style="padding-bottom: 32px;">
+                                        <div style="background-color: #fef2f2; padding: 20px; border-radius: 8px; border-left: 4px solid #dc2626; margin-bottom: 24px;">
+                                            <h3 style="color: #dc2626; font-size: 18px; font-weight: 600; margin: 0 0 8px 0;">
+                                                Unable to Process Payment
+                                            </h3>
+                                            <p style="color: #374151; font-size: 16px; line-height: 1.6; margin: 0;">
+                                                We were unable to charge your payment method during the validation process. This could be due to insufficient funds, an expired card, or incorrect payment information.
+                                            </p>
+                                        </div>
+                                        
+                                        <h3 style="color: #25364D; font-size: 18px; font-weight: 600; margin: 0 0 16px 0;">
+                                            What happened?
+                                        </h3>
+                                        <p style="color: #374151; font-size: 16px; line-height: 1.6; margin: 0 0 16px 0;">
+                                            %s
+                                        </p>
+                                        
+                                        <h3 style="color: #25364D; font-size: 18px; font-weight: 600; margin: 24px 0 16px 0;">
+                                            What you can do:
+                                        </h3>
+                                        <ul style="color: #374151; font-size: 16px; line-height: 1.6; margin: 0 0 24px 0; padding-left: 20px;">
+                                            <li style="margin-bottom: 8px;">Check that your card has sufficient funds</li>
+                                            <li style="margin-bottom: 8px;">Verify that your card information is correct</li>
+                                            <li style="margin-bottom: 8px;">Contact your bank if the issue persists</li>
+                                            <li>Try a different payment method</li>
+                                        </ul>
+                                    </td>
+                                </tr>
+                            </table>
+                            
+                            <!-- Action Button -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
+                                <tr>
+                                    <td style="text-align: center; padding: 32px 0;">
+                                        <a href="https://prosecurelsp.com/users/index.php" style="display: inline-block; background-color: #157347; color: #ffffff; text-decoration: none; font-weight: 600; font-size: 16px; padding: 16px 32px; border-radius: 8px; transition: background-color 0.2s;">
+                                            Update Payment Information
+                                        </a>
+                                    </td>
+                                </tr>
+                            </table>
+                            
+                            <!-- Secondary Info -->
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
+                                <tr>
+                                    <td style="text-align: center; padding-top: 24px; border-top: 1px solid #e5e7eb;">
+                                        <p style="color: #6b7280; font-size: 14px; margin: 0 0 16px 0;">
+                                            Need help? Contact our support team:
+                                        </p>
+                                        <p style="color: #157347; font-size: 14px; margin: 0;">
+                                            <a href="https://prosecurelsp.com/contact.php" style="color: #157347; text-decoration: none;">
+                                                https://prosecurelsp.com/contact.php
+                                            </a>
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                            
+                        </td>
+                    </tr>
+                    
+                    <!-- Footer -->
+                    <tr>
+                        <td style="background-color: #25364D; padding: 32px 40px; text-align: center;">
+                            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%%">
+                                <tr>
+                                    <td style="text-align: center; padding-bottom: 16px;">
+                                        <p style="color: #9ca3af; font-size: 14px; margin: 0; line-height: 1.5;">
+                                            %s
+                                        </p>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="text-align: center;">
+                                        <p style="color: #9ca3af; font-size: 12px; margin: 0;">
+                                            © 2025 ProSecureLSP. All rights reserved.
+                                        </p>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    
+                </table>
+                
+            </td>
+        </tr>
+    </table>
+</body>
+</html>`
 )

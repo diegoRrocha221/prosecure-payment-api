@@ -75,7 +75,6 @@ func sendSuccessResponse(w http.ResponseWriter, response models.APIResponse) {
 
 func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
     requestID := uuid.New().String()
-    //startTime := time.Now()
     log.Printf("[RequestID: %s] Starting payment processing", requestID)
 
     var req models.PaymentRequest
@@ -87,8 +86,8 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
 
     log.Printf("[RequestID: %s] Processing payment for checkout ID: %s", requestID, req.CheckoutID)
 
+    // Verificar se o checkout já foi processado
     processed, err := h.db.IsCheckoutProcessed(req.CheckoutID)
-    
     if err != nil {
         log.Printf("[RequestID: %s] Error checking checkout status: %v", requestID, err)
         sendErrorResponse(w, http.StatusInternalServerError, "Internal server error")
@@ -104,6 +103,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
 
+    // Adquirir lock para evitar processamento duplo
     acquired, err := h.db.LockCheckout(req.CheckoutID)
     if err != nil {
         log.Printf("[RequestID: %s] Error acquiring lock: %v", requestID, err)
@@ -118,6 +118,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     
     defer h.db.ReleaseLock(req.CheckoutID)
     
+    // Buscar dados do checkout (usar cache se disponível)
     var checkout *models.CheckoutData
     if cachedData, found := h.checkoutCache.Load(req.CheckoutID); found {
         cache := cachedData.(checkoutCache)
@@ -143,6 +144,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         })
     }
 
+    // Adicionar informações de billing ao request
     req.CustomerEmail = checkout.Email
     req.BillingInfo = &types.BillingInfoType{
         FirstName:   strings.Split(checkout.Name, " ")[0],
@@ -154,14 +156,15 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         Country:     "US",
         PhoneNumber: checkout.PhoneNumber,
     }
-		// DESABILITADO: Validação do cartão
-    /*
+
+    // Validar dados do cartão
     if !h.paymentService.ValidateCard(&req) {
         log.Printf("[RequestID: %s] Invalid card data", requestID)
         sendErrorResponse(w, http.StatusBadRequest, "Dados do cartão inválidos: verifique o número, data de validade e código de segurança")
         return
     }
-		*/
+
+    // Salvar dados de pagamento temporários
     ctxTemp, cancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer cancel()
     
@@ -178,79 +181,70 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         checkout.ID, req.CardNumber, req.Expiry, req.CVV, req.CardName)
     
     if err != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to store temporary payment data: %v", requestID, err)
+        log.Printf("[RequestID: %s] Failed to store temporary payment data: %v", requestID, err)
         sendErrorResponse(w, http.StatusInternalServerError, "Falha ao armazenar dados de pagamento")
         return
     }
 
+    // Registrar status inicial do pagamento
     _, err = h.db.GetDB().ExecContext(ctxTemp,
         `INSERT INTO payment_results 
          (request_id, checkout_id, status, created_at)
-         VALUES (?, ?, 'pending', NOW())`,
+         VALUES (?, ?, 'scheduled', NOW())`,
         requestID, checkout.ID)
     
     if err != nil {
         log.Printf("[RequestID: %s] Warning: Failed to store initial payment status: %v", requestID, err)
     }
-		/*
-    ctx := context.Background()
-    err = h.queue.Enqueue(ctx, queue.JobTypeProcessPayment, map[string]interface{}{
-        "checkout_id": checkout.ID,
-        "request_id":  requestID,
-    })
-    
-    if err != nil {
-        log.Printf("[RequestID: %s] Error enqueueing payment job: %v", requestID, err)
-        sendErrorResponse(w, http.StatusInternalServerError, "Falha ao iniciar processamento de pagamento")
-        return
-    }
 
-    log.Printf("[RequestID: %s] Payment processing enqueued in %v", requestID, time.Since(startTime))
-
-    sendSuccessResponse(w, models.APIResponse{
-        Status:  "pending",
-        Message: "Processamento de pagamento iniciado",
-        Data: map[string]interface{}{
-            "request_id":  requestID,
-            "checkout_id": checkout.ID,
-            "status_url": fmt.Sprintf("/api/check-payment-status?request_id=%s", requestID),
-        },
-    })
-		*/
-		transactionID := fmt.Sprintf("TEST-%s", uuid.New().String())
+    // CRIAR CONTA IMEDIATAMENTE para uso do cliente
+    log.Printf("[RequestID: %s] Creating user account immediately", requestID)
     
-    // Atualizar o status de pagamento para sucesso
-    _, err = h.db.GetDB().ExecContext(ctxTemp,
-        `INSERT INTO payment_results 
-         (request_id, checkout_id, status, transaction_id, created_at)
-         VALUES (?, ?, 'success', ?, NOW())
-         ON DUPLICATE KEY UPDATE
-         status = 'success',
-         transaction_id = ?,
-         created_at = NOW()`,
-        requestID, checkout.ID, transactionID, transactionID)
-    
-    if err != nil {
-        log.Printf("[RequestID: %s] Error updating payment status: %v", requestID, err)
+    cardData := &models.CardData{
+        Number: req.CardNumber,
+        Expiry: req.Expiry,
     }
     
-    // Criar a conta diretamente, sem processar pagamento real
-    err = h.createAccountsAndNotify(checkout, &req, transactionID)
+    err = h.createAccountsAndNotify(checkout, &req, "PENDING")
     if err != nil {
         log.Printf("[RequestID: %s] Error creating account: %v", requestID, err)
         sendErrorResponse(w, http.StatusInternalServerError, "Falha ao criar conta")
         return
     }
     
-    log.Printf("[RequestID: %s] Account created successfully with test transaction ID: %s", requestID, transactionID)
+    log.Printf("[RequestID: %s] Account created successfully, scheduling payment processing", requestID)
+
+    // AGENDAR: Processamento de pagamento (transação teste + void + ARB)
+    // TODO: ALTERAR PARA 1 HORA EM PRODUÇÃO (time.Hour)
+    paymentDelay := 2 * time.Minute // TESTE: 2 minutos | PRODUÇÃO: time.Hour
+    
+    ctx := context.Background()
+    err = h.queue.EnqueueDelayed(ctx, queue.JobTypeDelayedPayment, map[string]interface{}{
+        "checkout_id": checkout.ID,
+        "request_id":  requestID,
+    }, paymentDelay)
+    
+    if err != nil {
+        log.Printf("[RequestID: %s] Error enqueueing delayed payment job: %v", requestID, err)
+        sendErrorResponse(w, http.StatusInternalServerError, "Falha ao agendar processamento de pagamento")
+        return
+    }
+
+    log.Printf("[RequestID: %s] Payment processing scheduled for %v from now", requestID, paymentDelay)
+
+    // Calcular horário estimado de processamento
+    processingTime := time.Now().Add(paymentDelay)
 
     sendSuccessResponse(w, models.APIResponse{
         Status:  "success",
-        Message: "Processamento concluído com sucesso",
+        Message: "Conta criada com sucesso! Processamento de pagamento agendado.",
         Data: map[string]interface{}{
-            "request_id":  requestID,
-            "checkout_id": checkout.ID,
-            "transaction_id": transactionID,
+            "request_id":        requestID,
+            "checkout_id":       checkout.ID,
+            "account_created":   true,
+            "processing_time":   processingTime.Format("2006-01-02 15:04:05"),
+            "status_url":       fmt.Sprintf("/api/check-payment-status?request_id=%s", requestID),
+            "message":          "Sua conta foi criada e já está disponível para uso. O processamento do pagamento será realizado em breve.",
         },
     })
 }
@@ -270,7 +264,7 @@ func (h *PaymentHandler) CheckPaymentStatus(w http.ResponseWriter, r *http.Reque
     var checkoutID string
     
     err := h.db.GetDB().QueryRowContext(ctx,
-        `SELECT status, transaction_id, error_message, created_at, checkout_id 
+        `SELECT status, COALESCE(transaction_id, ''), COALESCE(error_message, ''), created_at, checkout_id 
          FROM payment_results 
          WHERE request_id = ?
          ORDER BY created_at DESC
@@ -285,6 +279,7 @@ func (h *PaymentHandler) CheckPaymentStatus(w http.ResponseWriter, r *http.Reque
         sendErrorResponse(w, http.StatusInternalServerError, "Error checking payment status")
         return
     }
+
     var accountCreated bool = false
     if status == "success" && checkoutID != "" {
         h.db.GetDB().QueryRowContext(ctx,
@@ -307,13 +302,14 @@ func (h *PaymentHandler) CheckPaymentStatus(w http.ResponseWriter, r *http.Reque
         },
     }
     
-    if errorMessage != "" && status == "failed" {
+    if errorMessage != "" && (status == "failed" || status == "error") {
         response.Data.(map[string]interface{})["error"] = errorMessage
     }
     
     sendSuccessResponse(w, response)
 }
 
+// createAccountsAndNotify - Mantido para compatibilidade (usado pelo worker)
 func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, payment *models.PaymentRequest, transactionID string) error {
     startTime := time.Now()
     defer func() {
@@ -440,7 +436,6 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
     encodedCode := base64.StdEncoding.EncodeToString([]byte(code))
 
     go func() {
-        
         if err := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code); err != nil {
             log.Printf("Warning: Failed to update activation code: %v", err)
         }
@@ -507,7 +502,6 @@ func (h *PaymentHandler) generateActivationEmail(username, activationURL string)
     
     footer := "Thank you so much,\nThe ProSecureLSP Team"
     
-    // Template corrigido com 5 argumentos: username, content, activationURL, activationURL (fallback), footer
     return fmt.Sprintf(
         email.ActivationEmailTemplate,
         username,        // %s - Hi username!
@@ -517,7 +511,6 @@ func (h *PaymentHandler) generateActivationEmail(username, activationURL string)
         footer,          // %s - Footer message
     )
 }
-
 
 func (h *PaymentHandler) generateInvoiceEmail(checkout *models.CheckoutData) string {
     var total float64
@@ -569,7 +562,6 @@ func (h *PaymentHandler) generateInvoiceEmail(checkout *models.CheckoutData) str
     // Gerar número da invoice único
     invoiceNumber := fmt.Sprintf("INV-%s", time.Now().Format("20060102-150405"))
 
-    // Template corrigido com 5 argumentos: invoiceNumber, plansTable, totalsSection, status, footer
     return fmt.Sprintf(
         email.InvoiceEmailTemplate,
         invoiceNumber,   // %s - Invoice number
@@ -639,7 +631,6 @@ func (h *PaymentHandler) UpdateCheckoutID(w http.ResponseWriter, r *http.Request
         sendErrorResponse(w, http.StatusBadRequest, "Missing old_id or new_id parameter")
         return
     }
-
 
     sendSuccessResponse(w, models.APIResponse{
         Status:  "success",
