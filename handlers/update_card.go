@@ -139,7 +139,7 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
     log.Printf("[UpdateCard %s] Step 2: Voiding test transaction", requestID)
     
     if err := h.paymentService.VoidTransaction(transactionID); err != nil {
-        log.Printf("[UpdateCard %s] Failed to void transaction: %v", requestID, err)
+        log.Printf("[UpdateCard %s] Failed to void test transaction: %v", requestID, err)
         h.sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to void test transaction: %v", err))
         return
     }
@@ -149,8 +149,21 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
     // ETAPA 3: Criar nova subscription usando dados da master account
     log.Printf("[UpdateCard %s] Step 3: Creating new subscription", requestID)
     
-    // Converter master account para checkout data para usar na subscription
-    checkoutData := h.convertMasterAccountToCheckoutData(masterAccount)
+    // CORREÇÃO: Converter master account para checkout data COM preços corretos
+    checkoutData, err := h.convertMasterAccountToCheckoutDataWithPrices(masterAccount)
+    if err != nil {
+        log.Printf("[UpdateCard %s] Failed to convert master account data: %v", requestID, err)
+        h.sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to process account data: %v", err))
+        return
+    }
+    
+    log.Printf("[UpdateCard %s] Checkout data total calculated: $%.2f", requestID, checkoutData.Total)
+    
+    if checkoutData.Total <= 0 {
+        log.Printf("[UpdateCard %s] Invalid subscription amount: $%.2f", requestID, checkoutData.Total)
+        h.sendErrorResponse(w, http.StatusInternalServerError, "Invalid subscription amount calculated")
+        return
+    }
     
     if err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData); err != nil {
         log.Printf("[UpdateCard %s] Failed to setup subscription: %v", requestID, err)
@@ -242,9 +255,12 @@ func (h *UpdateCardHandler) checkUserInactiveStatus(email, username string) (boo
     return isActive == 9, nil
 }
 
-// convertMasterAccountToCheckoutData converte master account para checkout data para usar na subscription
-func (h *UpdateCardHandler) convertMasterAccountToCheckoutData(master *models.MasterAccount) *models.CheckoutData {
-    return &models.CheckoutData{
+// CORREÇÃO: Nova função que converte master account para checkout data COM preços corretos
+func (h *UpdateCardHandler) convertMasterAccountToCheckoutDataWithPrices(master *models.MasterAccount) (*models.CheckoutData, error) {
+    log.Printf("Converting master account to checkout data with prices. Total price from DB: $%.2f", master.TotalPrice)
+    
+    // Usar o total price que já está salvo na master account
+    checkoutData := &models.CheckoutData{
         ID:          master.ReferenceUUID,
         Name:        fmt.Sprintf("%s %s", master.Name, master.LastName),
         Email:       master.Email,
@@ -257,41 +273,90 @@ func (h *UpdateCardHandler) convertMasterAccountToCheckoutData(master *models.Ma
         Additional:  master.AdditionalInfo,
         PlanID:      master.Plan,
         PlansJSON:   master.PurchasedPlans,
-        Total:       master.TotalPrice,
-        Plans:       h.parsePlansFromJSON(master.PurchasedPlans, master.IsAnnually),
+        Total:       master.TotalPrice, // CORREÇÃO: Usar o preço total salvo
     }
+    
+    // Parse dos planos com preços corretos do banco de dados
+    plans, err := h.parsePlansFromJSONWithPrices(master.PurchasedPlans, master.IsAnnually)
+    if err != nil {
+        log.Printf("Warning: Failed to parse plans JSON, using total from master account: %v", err)
+        // Se falhar o parse, ainda assim usar o total salvo na master account
+        plans = []models.Plan{
+            {
+                PlanID:   master.Plan,
+                PlanName: "Subscription Plan",
+                Price:    master.TotalPrice,
+                Annually: master.IsAnnually,
+            },
+        }
+    }
+    
+    checkoutData.Plans = plans
+    
+    log.Printf("Checkout data converted successfully. Final total: $%.2f, Plans count: %d", checkoutData.Total, len(checkoutData.Plans))
+    return checkoutData, nil
 }
 
-// parsePlansFromJSON converte o JSON de planos para slice de Plans
-func (h *UpdateCardHandler) parsePlansFromJSON(plansJSON string, isAnnually int) []models.Plan {
+// CORREÇÃO: Nova função que faz parse dos planos buscando preços atuais do banco de dados
+func (h *UpdateCardHandler) parsePlansFromJSONWithPrices(plansJSON string, isAnnually int) ([]models.Plan, error) {
     var plans []models.Plan
     
     // Tentar fazer parse do JSON
     var rawPlans []map[string]interface{}
     if err := json.Unmarshal([]byte(plansJSON), &rawPlans); err != nil {
-        log.Printf("Warning: Failed to parse plans JSON: %v", err)
-        return plans
+        return nil, fmt.Errorf("failed to unmarshal plans JSON: %v", err)
     }
     
-    for _, rawPlan := range rawPlans {
+    log.Printf("Parsing %d plans from JSON", len(rawPlans))
+    
+    for i, rawPlan := range rawPlans {
         plan := models.Plan{
             Annually: isAnnually,
         }
         
+        // Extrair ID do plano
         if planID, ok := rawPlan["plan_id"].(float64); ok {
             plan.PlanID = int(planID)
+        } else {
+            log.Printf("Warning: Plan %d missing plan_id", i)
+            continue
         }
-        if planName, ok := rawPlan["plan_name"].(string); ok {
-            plan.PlanName = planName
+        
+        // Buscar preço atual do banco de dados
+        var currentPrice float64
+        var planName string
+        err := h.db.GetDB().QueryRow(
+            "SELECT name, price FROM plans WHERE id = ?", 
+            plan.PlanID).Scan(&planName, &currentPrice)
+        
+        if err != nil {
+            log.Printf("Warning: Failed to get current price for plan %d: %v", plan.PlanID, err)
+            // Fallback: usar preço do JSON se disponível
+            if price, ok := rawPlan["price"].(float64); ok {
+                currentPrice = price
+            } else {
+                log.Printf("Warning: No price available for plan %d, skipping", plan.PlanID)
+                continue
+            }
         }
-        if price, ok := rawPlan["price"].(float64); ok {
-            plan.Price = price
+        
+        plan.PlanName = planName
+        plan.Price = currentPrice
+        
+        // Aplicar preço anual se necessário
+        if isAnnually == 1 {
+            plan.Price = currentPrice * 10 // 10 meses = desconto anual
         }
         
         plans = append(plans, plan)
+        log.Printf("Plan %d: %s - $%.2f (annually: %d)", plan.PlanID, plan.PlanName, plan.Price, isAnnually)
     }
     
-    return plans
+    if len(plans) == 0 {
+        return nil, fmt.Errorf("no valid plans found in JSON")
+    }
+    
+    return plans, nil
 }
 
 // updateAccountAfterCardUpdate atualiza os dados no banco após atualização do cartão

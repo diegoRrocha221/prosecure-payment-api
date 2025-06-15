@@ -1,3 +1,4 @@
+// worker/payment_worker.go
 package worker
 
 import (
@@ -114,7 +115,7 @@ func (w *Worker) processJobs(workerID int) {
 				continue
 			}
 			
-			log.Printf("Worker %d processing job %s of type %s", workerID, job.ID, job.Type)
+			log.Printf("Worker %d processing job %s of type %s (retry %d)", workerID, job.ID, job.Type, job.RetryCount)
 			
 			// Process the job
 			jobErr := w.processJob(job)
@@ -175,7 +176,7 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         requestID = job.ID
     }
     
-    log.Printf("[RequestID: %s] Processing delayed PAYMENT ONLY for checkout: %s (account already created)", requestID, checkoutID)
+    log.Printf("[RequestID: %s] Processing delayed PAYMENT ONLY for checkout: %s (account already created), retry: %d", requestID, checkoutID, job.RetryCount)
     
     // Verificar se o checkout já foi processado para pagamento
     var paymentProcessed bool
@@ -215,7 +216,9 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     
     if err != nil {
         log.Printf("[RequestID: %s] Failed to retrieve payment data: %v", requestID, err)
-        return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired", true) // enviar email
+        // CORREÇÃO: Verificar se é a última tentativa antes de enviar email
+        isLastAttempt := w.isLastAttempt(job)
+        return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired", isLastAttempt)
     }
     
     // Criar objeto de requisição de pagamento
@@ -283,7 +286,9 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         }
         
         log.Printf("[RequestID: %s] All test transaction attempts failed", requestID)
-        return w.handlePaymentFailure(checkout, requestID, finalError, true) // true = enviar email
+        // CORREÇÃO: Verificar se é a última tentativa antes de enviar email
+        isLastAttempt := w.isLastAttempt(job)
+        return w.handlePaymentFailure(checkout, requestID, finalError, isLastAttempt)
     }
     
     transactionID := resp.TransactionID
@@ -295,7 +300,8 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     voidErr := w.paymentService.VoidTransaction(transactionID)
     if voidErr != nil {
         log.Printf("[RequestID: %s] Failed to void test transaction: %v", requestID, voidErr)
-        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to void test transaction: %v", voidErr), true) // enviar email
+        isLastAttempt := w.isLastAttempt(job)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to void test transaction: %v", voidErr), isLastAttempt)
     }
     
     log.Printf("[RequestID: %s] Test transaction voided successfully", requestID)
@@ -306,7 +312,8 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     subscriptionErr := w.paymentService.SetupRecurringBilling(paymentReq, checkout)
     if subscriptionErr != nil {
         log.Printf("[RequestID: %s] Failed to setup subscription: %v", requestID, subscriptionErr)
-        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", subscriptionErr), true) // enviar email
+        isLastAttempt := w.isLastAttempt(job)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", subscriptionErr), isLastAttempt)
     }
     
     log.Printf("[RequestID: %s] Subscription created successfully", requestID)
@@ -382,6 +389,12 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     return nil
 }
 
+// CORREÇÃO: Nova função para verificar se é a última tentativa
+func (w *Worker) isLastAttempt(job *queue.Job) bool {
+    const maxRetries = 5 // Mesmo valor definido em queue/jobs_queue.go
+    return job.RetryCount >= maxRetries
+}
+
 // handlePaymentFailure - Trata falhas de pagamento, enviando email apenas se sendEmail = true
 func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, errorMsg string, sendEmail bool) error {
     log.Printf("[RequestID: %s] Handling payment failure for %s: %s (sendEmail: %v)", requestID, checkout.Email, errorMsg, sendEmail)
@@ -412,6 +425,7 @@ func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, 
     
     // Enviar email de notificação de falha APENAS se solicitado
     if sendEmail {
+        log.Printf("[RequestID: %s] Sending failure notification email (final attempt)", requestID)
         failureEmailContent := w.generatePaymentFailureEmail(checkout.Name, errorMsg)
         
         emailErr := w.emailService.SendEmail(
@@ -427,7 +441,7 @@ func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, 
             log.Printf("[RequestID: %s] Payment failure email sent to %s", requestID, checkout.Email)
         }
     } else {
-        log.Printf("[RequestID: %s] Skipping failure email (not final attempt)", requestID)
+        log.Printf("[RequestID: %s] Skipping failure email (not final attempt, retry %d will follow)", requestID, requestID)
     }
     
     // Limpar dados de cartão temporários
@@ -1011,13 +1025,13 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 		}
 	}
 	
-	if expiryVal, ok := job.Data["expiry"]; ok && expiryVal != nil {
+	if expiryVal, ok := job.Data["card_expiry"]; ok && expiryVal != nil {
 		if expiryStr, ok := expiryVal.(string); ok {
 			expiry = expiryStr
 		}
 	}
 	
-	if cvvVal, ok := job.Data["cvv"]; ok && cvvVal != nil {
+	if cvvVal, ok := job.Data["card_cvv"]; ok && cvvVal != nil {
 		if cvvStr, ok := cvvVal.(string); ok {
 			cvv = cvvStr
 		}
@@ -1121,6 +1135,12 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 		}
 		
 		log.Printf("Setting up subscription for checkout %s", checkoutID)
+		
+		// CORREÇÃO: Verificar se o username não é muito longo para subscription
+		if len(checkout.Username) > 30 { // Limitar username para evitar nome de subscription muito longo
+			log.Printf("Warning: Username '%s' is very long (%d chars), may cause subscription name issues", 
+				checkout.Username, len(checkout.Username))
+		}
 		
 		// Configurar a assinatura recorrente
 		err = w.paymentService.SetupRecurringBilling(paymentRequest, checkout)

@@ -154,6 +154,7 @@ func (q *Queue) CompleteJob(ctx context.Context, job *Job) error {
 	return nil
 }
 
+// CORREÇÃO: Melhorar lógica de retry e controle de email
 func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 	job.RetryCount++
 	
@@ -171,11 +172,13 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 		log.Printf("Warning: Failed to remove job %s from processing queue: %v", job.ID, err)
 	}
 	
+	// CORREÇÃO: Melhor controle de retry com informação sobre última tentativa
 	if job.RetryCount <= maxRetries {
 		delaySeconds := 15 * (1 << (job.RetryCount - 1))
 		retryTime := time.Now().Add(time.Duration(delaySeconds) * time.Second)
 		
 		job.Data["next_retry_at"] = retryTime
+		job.Data["is_last_attempt"] = job.RetryCount == maxRetries // CORREÇÃO: Flag para última tentativa
 		
 		updatedJobJSON, _ := json.Marshal(job)
 		
@@ -192,16 +195,21 @@ func (q *Queue) FailJob(ctx context.Context, job *Job, err error) error {
 			}
 		}
 		
-		log.Printf("Job %s of type %s scheduled for retry %d/%d in %d seconds", 
-			job.ID, job.Type, job.RetryCount, maxRetries, delaySeconds)
+		log.Printf("Job %s of type %s scheduled for retry %d/%d in %d seconds (last_attempt: %v)", 
+			job.ID, job.Type, job.RetryCount, maxRetries, delaySeconds, job.RetryCount == maxRetries)
 		return nil
 	}
 	
-	if err := q.client.RPush(ctx, q.failed, jobJSON).Err(); err != nil {
+	// CORREÇÃO: Marcar explicitamente que todas as tentativas falharam
+	job.Data["all_retries_exhausted"] = true
+	job.Data["final_failure_at"] = time.Now()
+	finalJobJSON, _ := json.Marshal(job)
+	
+	if err := q.client.RPush(ctx, q.failed, finalJobJSON).Err(); err != nil {
 		return fmt.Errorf("failed to push job to failed queue: %v", err)
 	}
 
-	log.Printf("Job %s of type %s moved to failed queue after %d retries", job.ID, job.Type, job.RetryCount)
+	log.Printf("Job %s of type %s moved to failed queue after %d retries (all attempts exhausted)", job.ID, job.Type, job.RetryCount)
 	return nil
 }
 
@@ -235,8 +243,8 @@ func (q *Queue) ProcessDelayedJobs(ctx context.Context) error {
 			continue
 		}
 		
-		log.Printf("Moved delayed job %s of type %s to main queue for processing", 
-			job.ID, job.Type)
+		log.Printf("Moved delayed job %s of type %s to main queue for processing (retry %d)", 
+			job.ID, job.Type, job.RetryCount)
 	}
 	
 	return nil
@@ -260,16 +268,40 @@ func (q *Queue) RetryJob(ctx context.Context, jobID string) error {
 				return fmt.Errorf("failed to remove job from failed queue: %v", err)
 			}
 
-			if err := q.client.RPush(ctx, q.queueName, jobJSON).Err(); err != nil {
+			// CORREÇÃO: Resetar contador de retry para retry manual
+			job.RetryCount = 0
+			job.Data["manual_retry"] = true
+			job.Data["manual_retry_at"] = time.Now()
+			
+			// Remover flags de falha anterior
+			delete(job.Data, "all_retries_exhausted")
+			delete(job.Data, "final_failure_at")
+			delete(job.Data, "is_last_attempt")
+			
+			updatedJobJSON, _ := json.Marshal(job)
+
+			if err := q.client.RPush(ctx, q.queueName, updatedJobJSON).Err(); err != nil {
 				return fmt.Errorf("failed to push job to main queue: %v", err)
 			}
 
-			log.Printf("Requeued job %s of type %s", job.ID, job.Type)
+			log.Printf("Manually requeued job %s of type %s (retry count reset)", job.ID, job.Type)
 			return nil
 		}
 	}
 
 	return fmt.Errorf("job %s not found in failed queue", jobID)
+}
+
+// CORREÇÃO: Nova função para verificar se é a última tentativa baseada nos dados do job
+func (q *Queue) IsLastAttempt(job *Job) bool {
+	if isLast, exists := job.Data["is_last_attempt"]; exists {
+		if lastAttempt, ok := isLast.(bool); ok {
+			return lastAttempt
+		}
+	}
+	// Fallback: verificar se atingiu o máximo de retries
+	const maxRetries = 5
+	return job.RetryCount >= maxRetries
 }
 
 func (q *Queue) Client() *redis.Client {

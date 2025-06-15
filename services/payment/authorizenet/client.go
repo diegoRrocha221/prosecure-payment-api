@@ -21,6 +21,7 @@ const (
     DuplicateWindow = 3
     RequestTimeout = 45 * time.Second // Reduzido para 15 segundos para evitar esperas longas
     SilentPostURL = "https://api.prosecurelsp.com/api/authorize-net/webhook/silent-post"
+    MaxRefIDLength = 20 // CORREÇÃO: Definir constante para máximo tamanho do RefID
 )
 
 type Client struct {
@@ -69,6 +70,16 @@ func (c *Client) getMerchantAuthentication() merchantAuthenticationType {
         Name:           c.apiLoginID,
         TransactionKey: c.transactionKey,
     }
+}
+
+// CORREÇÃO: Nova função utilitária para truncar RefID de forma consistente
+func (c *Client) normalizeRefID(refID string) string {
+    if len(refID) > MaxRefIDLength {
+        truncated := refID[:MaxRefIDLength]
+        log.Printf("RefID truncated from '%s' to '%s' (max %d chars)", refID, truncated, MaxRefIDLength)
+        return truncated
+    }
+    return refID
 }
 
 // Método auxiliar para criar contexto com timeout
@@ -133,14 +144,13 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
         txRequest.BillTo = req.BillingInfo
     }
     
-    refId := req.CheckoutID
-    if len(refId) > 20 {
-        refId = refId[:19]
-    }
+    // CORREÇÃO: Usar função normalizada para RefID
+    refId := c.normalizeRefID(req.CheckoutID)
+    
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
-            RefID: refId,
+            RefID: refId, // CORREÇÃO: Usar RefID normalizado
             TransactionRequest: txRequest,
         },
     }
@@ -151,8 +161,8 @@ func (c *Client) ProcessPayment(req *models.PaymentRequest) (*models.Transaction
     }
 
     // Log da requisição (sem dados sensíveis)
-    log.Printf("Sending payment request to Authorize.net for checkout: %s, Amount: %s, Order ID: %s", 
-        req.CheckoutID, txRequest.Amount, orderID)
+    log.Printf("Sending payment request to Authorize.net for checkout: %s (RefID: %s), Amount: %s, Order ID: %s", 
+        req.CheckoutID, refId, txRequest.Amount, orderID)
 
     // Usar timeout específico para esta operação
     ctx, cancel := c.createRequestContext()

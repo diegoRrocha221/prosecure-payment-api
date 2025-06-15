@@ -76,12 +76,38 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
     // Definir data de início para um mês após a data atual
     startDate := time.Now().AddDate(0, 1, 0).Format("2006-01-02") 
     
+    // CORREÇÃO: Truncar RefID para máximo de 20 caracteres (mesmo limite usado no client.go)
+    refId := payment.CheckoutID
+    if len(refId) > 20 {
+        refId = refId[:20]
+        log.Printf("RefID truncated from %s to %s for ARB request", payment.CheckoutID, refId)
+    }
+    
+    // CORREÇÃO: Truncar nome da subscription para máximo de 50 caracteres
+    maxNameLength := 50
+    subscriptionName := fmt.Sprintf("ProSecure Subscription - %s", checkout.Username)
+    if len(subscriptionName) > maxNameLength {
+        // Truncar mantendo a parte mais importante (username)
+        prefix := "ProSecure - "
+        availableSpace := maxNameLength - len(prefix)
+        if availableSpace > 0 && len(checkout.Username) > availableSpace {
+            truncatedUsername := checkout.Username[:availableSpace]
+            subscriptionName = prefix + truncatedUsername
+        } else if availableSpace > 0 {
+            subscriptionName = prefix + checkout.Username
+        } else {
+            subscriptionName = "ProSecure Subscription"
+        }
+        log.Printf("Subscription name truncated from '%s' to '%s' (max %d chars)", 
+            fmt.Sprintf("ProSecure Subscription - %s", checkout.Username), subscriptionName, maxNameLength)
+    }
+    
     // Construir a requisição de assinatura
     subscription := ARBSubscriptionRequest{
         MerchantAuthentication: c.getMerchantAuthentication(),
-        RefID: payment.CheckoutID,
+        RefID: refId, // CORREÇÃO: Usar RefID truncado
         Subscription: ARBSubscriptionType{
-            Name: fmt.Sprintf("ProSecure Subscription - %s", checkout.Username),
+            Name: subscriptionName, // CORREÇÃO: Usar nome truncado
             PaymentSchedule: PaymentScheduleType{
                 Interval:         interval,
                 StartDate:       startDate,
@@ -124,7 +150,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         return nil, fmt.Errorf("error marshaling subscription request: %v", err)
     }
 
-    log.Printf("Sending ARB request to Authorize.net for checkout: %s", payment.CheckoutID)
+    log.Printf("Sending ARB request to Authorize.net for checkout: %s (RefID: %s)", payment.CheckoutID, refId)
 
     // Criar contexto com timeout para controle de tempo da requisição
     ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout) 
@@ -169,6 +195,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         if len(response.Messages.Message) > 0 {
             message = response.Messages.Message[0].Text
         }
+        log.Printf("ARB Error: %s", message)
         return &models.SubscriptionResponse{
             Success: false,
             Message: message,
@@ -182,6 +209,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
         }, nil
     }
 
+    log.Printf("ARB subscription created successfully with ID: %s", response.SubscriptionID)
     return &models.SubscriptionResponse{
         Success:        true,
         SubscriptionID: response.SubscriptionID,
