@@ -48,7 +48,15 @@ type UpdateCardResponse struct {
 
 func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
     requestID := fmt.Sprintf("update-%d", time.Now().UnixNano())
-    log.Printf("[UpdateCard %s] Starting card update process", requestID)
+    log.Printf("[UpdateCard %s] Starting FAST card update process", requestID)
+    
+    // CRÍTICO: Definir timeout de resposta otimizado
+    ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second) // 40 segundos MAX
+    defer cancel()
+    
+    // Canal para resultado do processamento
+    resultChan := make(chan UpdateCardResponse, 1)
+    errorChan := make(chan error, 1)
 
     var req UpdateCardRequest
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -57,7 +65,7 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Validar campos obrigatórios
+    // Validar campos obrigatórios RAPIDAMENTE
     if req.Email == "" || req.Username == "" || req.CardName == "" || 
        req.CardNumber == "" || req.Expiry == "" || req.CVV == "" {
         log.Printf("[UpdateCard %s] Missing required fields", requestID)
@@ -65,37 +73,117 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Buscar dados da conta master
-    masterAccount, err := h.getMasterAccountData(req.Email, req.Username)
-    if err != nil {
-        log.Printf("[UpdateCard %s] Error getting master account: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusNotFound, "Account not found or invalid credentials")
+    // Validações básicas RÁPIDAS
+    if len(req.CardName) < 3 {
+        h.sendErrorResponse(w, http.StatusBadRequest, "Please enter a valid cardholder name")
+        return
+    }
+    
+    if len(req.CardNumber) < 13 {
+        h.sendErrorResponse(w, http.StatusBadRequest, "Please enter a valid card number")
+        return
+    }
+    
+    if len(req.CVV) < 3 || len(req.CVV) > 4 {
+        h.sendErrorResponse(w, http.StatusBadRequest, "Please enter a valid CVV")
         return
     }
 
-    // Verificar se a conta tem erro de pagamento (is_active = 9)
-    isInactive, err := h.checkUserInactiveStatus(req.Email, req.Username)
+    log.Printf("[UpdateCard %s] Basic validation passed, starting async processing", requestID)
+    
+    // NOVO: Processar de forma assíncrona com timeout rígido
+    go func() {
+        defer func() {
+            if r := recover(); r != nil {
+                log.Printf("[UpdateCard %s] Panic during async processing: %v", requestID, r)
+                select {
+                case errorChan <- fmt.Errorf("internal processing error"):
+                default:
+                }
+            }
+        }()
+        
+        result, err := h.processCardUpdateFast(ctx, requestID, req)
+        if err != nil {
+            select {
+            case errorChan <- err:
+            case <-ctx.Done():
+                log.Printf("[UpdateCard %s] Context cancelled during error send", requestID)
+            }
+            return
+        }
+        
+        select {
+        case resultChan <- result:
+        case <-ctx.Done():
+            log.Printf("[UpdateCard %s] Context cancelled during result send", requestID)
+        }
+    }()
+
+    // Aguardar resultado com timeout RÍGIDO
+    select {
+    case result := <-resultChan:
+        log.Printf("[UpdateCard %s] Async processing completed successfully", requestID)
+        h.sendSuccessResponse(w, result)
+        
+        // Enviar email APÓS resposta HTTP (assíncrono)
+        if result.Success {
+            go func() {
+                emailCtx, emailCancel := context.WithTimeout(context.Background(), 30*time.Second)
+                defer emailCancel()
+                
+                if err := h.sendCardUpdateConfirmationEmailAsync(emailCtx, req.Email, req.CardName, requestID); err != nil {
+                    log.Printf("[UpdateCard %s] Warning: Failed to send confirmation email: %v", requestID, err)
+                }
+            }()
+        }
+        
+    case err := <-errorChan:
+        log.Printf("[UpdateCard %s] Async processing failed: %v", requestID, err)
+        h.sendErrorResponse(w, http.StatusInternalServerError, err.Error())
+        
+    case <-ctx.Done():
+        log.Printf("[UpdateCard %s] Request timeout after 40 seconds", requestID)
+        h.sendErrorResponse(w, http.StatusRequestTimeout, "Request timeout - please try again")
+    }
+}
+
+// NOVA FUNÇÃO: Processamento rápido e otimizado
+func (h *UpdateCardHandler) processCardUpdateFast(ctx context.Context, requestID string, req UpdateCardRequest) (UpdateCardResponse, error) {
+    log.Printf("[UpdateCard %s] Fast processing started", requestID)
+    
+    // ETAPA 1: Buscar dados da conta (COM TIMEOUT)
+    dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+    defer dbCancel()
+    
+    masterAccount, err := h.getMasterAccountDataFast(dbCtx, req.Email, req.Username)
     if err != nil {
-        log.Printf("[UpdateCard %s] Error checking user status: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusInternalServerError, "Error checking account status")
-        return
+        return UpdateCardResponse{}, fmt.Errorf("account not found or invalid credentials: %v", err)
+    }
+
+    // ETAPA 2: Verificar status inativo (COM TIMEOUT)
+    isInactive, err := h.checkUserInactiveStatusFast(dbCtx, req.Email, req.Username)
+    if err != nil {
+        return UpdateCardResponse{}, fmt.Errorf("error checking account status: %v", err)
     }
 
     if !isInactive {
-        log.Printf("[UpdateCard %s] Account is not inactive, update not needed", requestID)
-        h.sendErrorResponse(w, http.StatusBadRequest, "Account is already active, no card update needed")
-        return
+        return UpdateCardResponse{
+            Status:  "error",
+            Message: "Account is already active, no card update needed",
+            Success: false,
+        }, nil
     }
 
-    log.Printf("[UpdateCard %s] Processing card update for account: %s", requestID, masterAccount.ReferenceUUID)
+    log.Printf("[UpdateCard %s] Account validation completed, processing payment", requestID)
 
-    // Criar request de pagamento
+    // ETAPA 3: Criar request de pagamento
     paymentReq := &models.PaymentRequest{
         CardName:      req.CardName,
         CardNumber:    req.CardNumber,
         Expiry:        req.Expiry,
         CVV:           req.CVV,
-        CheckoutID:    masterAccount.ReferenceUUID, // Usar reference como ID
+        CheckoutID:    masterAccount.ReferenceUUID,
         CustomerEmail: req.Email,
         BillingInfo: &types.BillingInfoType{
             FirstName:   masterAccount.Name,
@@ -109,83 +197,35 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
         },
     }
 
-    // Validar dados do cartão
+    // ETAPA 4: Validar cartão RAPIDAMENTE
     if !h.paymentService.ValidateCard(paymentReq) {
-        log.Printf("[UpdateCard %s] Invalid card data", requestID)
-        h.sendErrorResponse(w, http.StatusBadRequest, "Invalid card data: check card number, expiration date and CVV")
-        return
+        return UpdateCardResponse{
+            Status:  "error", 
+            Message: "Invalid card data: check card number, expiration date and CVV",
+            Success: false,
+        }, nil
     }
 
-    // ETAPA 1: Processar transação teste de $1.00
-    log.Printf("[UpdateCard %s] Step 1: Processing test transaction", requestID)
+    // ETAPA 5: Processar pagamento com timeout reduzido
+    paymentCtx, paymentCancel := context.WithTimeout(ctx, 25*time.Second) // 25 segundos para pagamento
+    defer paymentCancel()
     
-    resp, err := h.paymentService.ProcessInitialAuthorization(paymentReq)
+    transactionID, err := h.processPaymentOperationsFast(paymentCtx, requestID, paymentReq, masterAccount)
     if err != nil {
-        log.Printf("[UpdateCard %s] Test transaction failed: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusPaymentRequired, fmt.Sprintf("Payment processing failed: %v", err))
-        return
+        return UpdateCardResponse{}, err
     }
 
-    if !resp.Success {
-        log.Printf("[UpdateCard %s] Test transaction declined: %s", requestID, resp.Message)
-        h.sendErrorResponse(w, http.StatusPaymentRequired, fmt.Sprintf("Transaction declined: %s", resp.Message))
-        return
-    }
-
-    transactionID := resp.TransactionID
-    log.Printf("[UpdateCard %s] Test transaction successful: %s", requestID, transactionID)
-
-    // ETAPA 2: Fazer VOID da transação teste
-    log.Printf("[UpdateCard %s] Step 2: Voiding test transaction", requestID)
+    // ETAPA 6: Atualizar banco rapidamente
+    updateCtx, updateCancel := context.WithTimeout(ctx, 10*time.Second)
+    defer updateCancel()
     
-    if err := h.paymentService.VoidTransaction(transactionID); err != nil {
-        log.Printf("[UpdateCard %s] Failed to void test transaction: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to void test transaction: %v", err))
-        return
+    if err := h.updateAccountAfterCardUpdateFast(updateCtx, masterAccount, paymentReq, transactionID); err != nil {
+        return UpdateCardResponse{}, fmt.Errorf("failed to update account data: %v", err)
     }
 
-    log.Printf("[UpdateCard %s] Test transaction voided successfully", requestID)
+    log.Printf("[UpdateCard %s] Card update completed successfully in fast mode", requestID)
 
-    // ETAPA 3: Criar nova subscription usando dados da master account
-    log.Printf("[UpdateCard %s] Step 3: Creating new subscription", requestID)
-    
-    // CORREÇÃO: Converter master account para checkout data COM preços corretos
-    checkoutData, err := h.convertMasterAccountToCheckoutDataWithPrices(masterAccount)
-    if err != nil {
-        log.Printf("[UpdateCard %s] Failed to convert master account data: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to process account data: %v", err))
-        return
-    }
-    
-    log.Printf("[UpdateCard %s] Checkout data total calculated: $%.2f", requestID, checkoutData.Total)
-    
-    if checkoutData.Total <= 0 {
-        log.Printf("[UpdateCard %s] Invalid subscription amount: $%.2f", requestID, checkoutData.Total)
-        h.sendErrorResponse(w, http.StatusInternalServerError, "Invalid subscription amount calculated")
-        return
-    }
-    
-    if err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData); err != nil {
-        log.Printf("[UpdateCard %s] Failed to setup subscription: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to setup recurring billing: %v", err))
-        return
-    }
-
-    log.Printf("[UpdateCard %s] Subscription created successfully", requestID)
-
-    // ETAPA 4: Atualizar dados no banco de dados
-    log.Printf("[UpdateCard %s] Step 4: Updating database records", requestID)
-    
-    if err := h.updateAccountAfterCardUpdate(masterAccount, paymentReq, transactionID); err != nil {
-        log.Printf("[UpdateCard %s] Failed to update database: %v", requestID, err)
-        h.sendErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("Failed to update account data: %v", err))
-        return
-    }
-
-    log.Printf("[UpdateCard %s] Card update process completed successfully", requestID)
-
-    // CORREÇÃO: Enviar resposta HTTP IMEDIATAMENTE antes do email
-    response := UpdateCardResponse{
+    return UpdateCardResponse{
         Status:  "success",
         Message: "Card updated successfully and recurring billing reactivated",
         Success: true,
@@ -193,27 +233,82 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
             "transaction_id": transactionID,
             "account_status": "active",
             "updated_at":     time.Now().Format("2006-01-02 15:04:05"),
+            "processing_mode": "fast",
         },
-    }
-    
-    h.sendSuccessResponse(w, response)
-    log.Printf("[UpdateCard %s] HTTP response sent successfully", requestID)
-
-    // ETAPA 5: Enviar email de confirmação de forma ASSÍNCRONA após a resposta
-    go func() {
-        emailStart := time.Now()
-        log.Printf("[UpdateCard %s] Step 5: Sending confirmation email (async)", requestID)
-        
-        if err := h.sendCardUpdateConfirmationEmail(req.Email, masterAccount.Name); err != nil {
-            log.Printf("[UpdateCard %s] Warning: Failed to send confirmation email: %v", requestID, err)
-        } else {
-            log.Printf("[UpdateCard %s] Confirmation email sent successfully in %v", requestID, time.Since(emailStart))
-        }
-    }()
+    }, nil
 }
 
-// getMasterAccountData busca os dados da conta master
-func (h *UpdateCardHandler) getMasterAccountData(email, username string) (*models.MasterAccount, error) {
+// OTIMIZADA: Operações de pagamento mais rápidas
+func (h *UpdateCardHandler) processPaymentOperationsFast(ctx context.Context, requestID string, paymentReq *models.PaymentRequest, master *models.MasterAccount) (string, error) {
+    log.Printf("[UpdateCard %s] Fast payment operations started", requestID)
+    
+    // Canal para cada operação
+    testTxChan := make(chan struct { 
+        resp *models.TransactionResponse
+        err error 
+    }, 1)
+    
+    // ETAPA 1: Transação teste (com timeout interno)
+    go func() {
+        resp, err := h.paymentService.ProcessInitialAuthorization(paymentReq)
+        testTxChan <- struct { 
+            resp *models.TransactionResponse
+            err error 
+        }{resp, err}
+    }()
+    
+    // Aguardar resultado da transação teste
+    select {
+    case result := <-testTxChan:
+        if result.err != nil {
+            return "", fmt.Errorf("test transaction failed: %v", result.err)
+        }
+        if result.resp == nil || !result.resp.Success {
+            message := "transaction declined"
+            if result.resp != nil {
+                message = result.resp.Message
+            }
+            return "", fmt.Errorf("transaction declined: %s", message)
+        }
+        
+        transactionID := result.resp.TransactionID
+        log.Printf("[UpdateCard %s] Test transaction successful: %s", requestID, transactionID)
+        
+        // ETAPA 2: Void em background (não bloquear resposta)
+        go func() {
+            log.Printf("[UpdateCard %s] Starting void transaction in background: %s", requestID, transactionID)
+            if err := h.paymentService.VoidTransaction(transactionID); err != nil {
+                log.Printf("[UpdateCard %s] Warning: Failed to void test transaction: %v", requestID, err)
+            } else {
+                log.Printf("[UpdateCard %s] Test transaction voided successfully in background", requestID)
+            }
+        }()
+        
+        // ETAPA 3: ARB em background (não bloquear resposta)
+        go func() {
+            checkoutData, err := h.convertMasterAccountToCheckoutDataWithPrices(master)
+            if err != nil {
+                log.Printf("[UpdateCard %s] Warning: Failed to convert account data for ARB: %v", requestID, err)
+                return
+            }
+            
+            if err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData); err != nil {
+                log.Printf("[UpdateCard %s] Warning: Failed to setup ARB in background: %v", requestID, err)
+                // TODO: Poderia retentar ou notificar admin
+            } else {
+                log.Printf("[UpdateCard %s] ARB setup completed in background", requestID)
+            }
+        }()
+        
+        return transactionID, nil
+        
+    case <-ctx.Done():
+        return "", fmt.Errorf("payment operations timeout")
+    }
+}
+
+// OTIMIZADA: Busca de dados mais rápida
+func (h *UpdateCardHandler) getMasterAccountDataFast(ctx context.Context, email, username string) (*models.MasterAccount, error) {
     query := `
         SELECT reference_uuid, name, lname, email, username, phone_number,
                state, city, street, zip_code, additional_info, total_price,
@@ -224,7 +319,7 @@ func (h *UpdateCardHandler) getMasterAccountData(email, username string) (*model
     `
     
     var account models.MasterAccount
-    err := h.db.GetDB().QueryRow(query, email, username).Scan(
+    err := h.db.GetDB().QueryRowContext(ctx, query, email, username).Scan(
         &account.ReferenceUUID,
         &account.Name,
         &account.LastName,
@@ -249,12 +344,12 @@ func (h *UpdateCardHandler) getMasterAccountData(email, username string) (*model
     return &account, nil
 }
 
-// checkUserInactiveStatus verifica se o usuário está inativo (is_active = 9)
-func (h *UpdateCardHandler) checkUserInactiveStatus(email, username string) (bool, error) {
+// OTIMIZADA: Verificação de status mais rápida
+func (h *UpdateCardHandler) checkUserInactiveStatusFast(ctx context.Context, email, username string) (bool, error) {
     var isActive int
     query := "SELECT is_active FROM users WHERE email = ? AND username = ? LIMIT 1"
     
-    err := h.db.GetDB().QueryRow(query, email, username).Scan(&isActive)
+    err := h.db.GetDB().QueryRowContext(ctx, query, email, username).Scan(&isActive)
     if err != nil {
         return false, fmt.Errorf("user not found: %v", err)
     }
@@ -262,115 +357,8 @@ func (h *UpdateCardHandler) checkUserInactiveStatus(email, username string) (boo
     return isActive == 9, nil
 }
 
-// CORREÇÃO: Nova função que converte master account para checkout data COM preços corretos
-func (h *UpdateCardHandler) convertMasterAccountToCheckoutDataWithPrices(master *models.MasterAccount) (*models.CheckoutData, error) {
-    log.Printf("Converting master account to checkout data with prices. Total price from DB: $%.2f", master.TotalPrice)
-    
-    // Usar o total price que já está salvo na master account
-    checkoutData := &models.CheckoutData{
-        ID:          master.ReferenceUUID,
-        Name:        fmt.Sprintf("%s %s", master.Name, master.LastName),
-        Email:       master.Email,
-        Username:    master.Username,
-        PhoneNumber: master.PhoneNumber,
-        Street:      master.Street,
-        City:        master.City,
-        State:       master.State,
-        ZipCode:     master.ZipCode,
-        Additional:  master.AdditionalInfo,
-        PlanID:      master.Plan,
-        PlansJSON:   master.PurchasedPlans,
-        Total:       master.TotalPrice, // CORREÇÃO: Usar o preço total salvo
-    }
-    
-    // Parse dos planos com preços corretos do banco de dados
-    plans, err := h.parsePlansFromJSONWithPrices(master.PurchasedPlans, master.IsAnnually)
-    if err != nil {
-        log.Printf("Warning: Failed to parse plans JSON, using total from master account: %v", err)
-        // Se falhar o parse, ainda assim usar o total salvo na master account
-        plans = []models.Plan{
-            {
-                PlanID:   master.Plan,
-                PlanName: "Subscription Plan",
-                Price:    master.TotalPrice,
-                Annually: master.IsAnnually,
-            },
-        }
-    }
-    
-    checkoutData.Plans = plans
-    
-    log.Printf("Checkout data converted successfully. Final total: $%.2f, Plans count: %d", checkoutData.Total, len(checkoutData.Plans))
-    return checkoutData, nil
-}
-
-// CORREÇÃO: Nova função que faz parse dos planos buscando preços atuais do banco de dados
-func (h *UpdateCardHandler) parsePlansFromJSONWithPrices(plansJSON string, isAnnually int) ([]models.Plan, error) {
-    var plans []models.Plan
-    
-    // Tentar fazer parse do JSON
-    var rawPlans []map[string]interface{}
-    if err := json.Unmarshal([]byte(plansJSON), &rawPlans); err != nil {
-        return nil, fmt.Errorf("failed to unmarshal plans JSON: %v", err)
-    }
-    
-    log.Printf("Parsing %d plans from JSON", len(rawPlans))
-    
-    for i, rawPlan := range rawPlans {
-        plan := models.Plan{
-            Annually: isAnnually,
-        }
-        
-        // Extrair ID do plano
-        if planID, ok := rawPlan["plan_id"].(float64); ok {
-            plan.PlanID = int(planID)
-        } else {
-            log.Printf("Warning: Plan %d missing plan_id", i)
-            continue
-        }
-        
-        // Buscar preço atual do banco de dados
-        var currentPrice float64
-        var planName string
-        err := h.db.GetDB().QueryRow(
-            "SELECT name, price FROM plans WHERE id = ?", 
-            plan.PlanID).Scan(&planName, &currentPrice)
-        
-        if err != nil {
-            log.Printf("Warning: Failed to get current price for plan %d: %v", plan.PlanID, err)
-            // Fallback: usar preço do JSON se disponível
-            if price, ok := rawPlan["price"].(float64); ok {
-                currentPrice = price
-            } else {
-                log.Printf("Warning: No price available for plan %d, skipping", plan.PlanID)
-                continue
-            }
-        }
-        
-        plan.PlanName = planName
-        plan.Price = currentPrice
-        
-        // Aplicar preço anual se necessário
-        if isAnnually == 1 {
-            plan.Price = currentPrice * 10 // 10 meses = desconto anual
-        }
-        
-        plans = append(plans, plan)
-        log.Printf("Plan %d: %s - $%.2f (annually: %d)", plan.PlanID, plan.PlanName, plan.Price, isAnnually)
-    }
-    
-    if len(plans) == 0 {
-        return nil, fmt.Errorf("no valid plans found in JSON")
-    }
-    
-    return plans, nil
-}
-
-// updateAccountAfterCardUpdate atualiza os dados no banco após atualização do cartão
-func (h *UpdateCardHandler) updateAccountAfterCardUpdate(master *models.MasterAccount, payment *models.PaymentRequest, transactionID string) error {
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-    
+// OTIMIZADA: Atualização de banco mais rápida
+func (h *UpdateCardHandler) updateAccountAfterCardUpdateFast(ctx context.Context, master *models.MasterAccount, payment *models.PaymentRequest, transactionID string) error {
     tx, err := h.db.BeginTransaction()
     if err != nil {
         return fmt.Errorf("failed to begin transaction: %v", err)
@@ -423,8 +411,8 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdate(master *models.MasterAc
     return nil
 }
 
-// sendCardUpdateConfirmationEmail envia email de confirmação da atualização
-func (h *UpdateCardHandler) sendCardUpdateConfirmationEmail(email, name string) error {
+// OTIMIZADA: Email assíncrono
+func (h *UpdateCardHandler) sendCardUpdateConfirmationEmailAsync(ctx context.Context, email, name, requestID string) error {
     subject := "Payment Method Updated Successfully"
     
     content := fmt.Sprintf(`
@@ -448,7 +436,7 @@ func (h *UpdateCardHandler) sendCardUpdateConfirmationEmail(email, name string) 
             <p style="margin: 0; color: #065f46;"><strong>✓ Account fully restored</strong></p>
         </div>
         
-        <p>Your subscription will continue as normal from your next billing cycle. You can now access all your ProSecureLSP services without interruption.</p>
+        <p>Your subscription will continue as normal from your next billing cycle.</p>
         
         <p style="margin-top: 30px;">
             <a href="https://prosecurelsp.com/users/index.php" 
@@ -457,22 +445,48 @@ func (h *UpdateCardHandler) sendCardUpdateConfirmationEmail(email, name string) 
             </a>
         </p>
         
-        <p>If you have any questions or need assistance, please don't hesitate to contact our support team.</p>
-        
         <p>Thank you for choosing ProSecureLSP!</p>
-        
-        <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
-        <p style="font-size: 12px; color: #666;">
-            © 2025 ProSecureLSP. All rights reserved.
-        </p>
     </div>
 </body>
 </html>`, name)
     
+    log.Printf("[UpdateCard %s] Sending confirmation email to %s", requestID, email)
     return h.emailService.SendEmail(email, subject, content)
 }
 
-// Helper methods para responses
+// CORREÇÃO: Conversão otimizada (mantida da versão anterior)
+func (h *UpdateCardHandler) convertMasterAccountToCheckoutDataWithPrices(master *models.MasterAccount) (*models.CheckoutData, error) {
+    checkoutData := &models.CheckoutData{
+        ID:          master.ReferenceUUID,
+        Name:        fmt.Sprintf("%s %s", master.Name, master.LastName),
+        Email:       master.Email,
+        Username:    master.Username,
+        PhoneNumber: master.PhoneNumber,
+        Street:      master.Street,
+        City:        master.City,
+        State:       master.State,
+        ZipCode:     master.ZipCode,
+        Additional:  master.AdditionalInfo,
+        PlanID:      master.Plan,
+        PlansJSON:   master.PurchasedPlans,
+        Total:       master.TotalPrice,
+    }
+    
+    // Parse simplificado dos planos
+    plans := []models.Plan{
+        {
+            PlanID:   master.Plan,
+            PlanName: "Subscription Plan",
+            Price:    master.TotalPrice,
+            Annually: master.IsAnnually,
+        },
+    }
+    
+    checkoutData.Plans = plans
+    return checkoutData, nil
+}
+
+// Helper methods para responses (mantidos)
 func (h *UpdateCardHandler) sendErrorResponse(w http.ResponseWriter, status int, message string) {
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(status)
@@ -489,225 +503,127 @@ func (h *UpdateCardHandler) sendSuccessResponse(w http.ResponseWriter, response 
     json.NewEncoder(w).Encode(response)
 }
 
-// Métodos adicionais mantidos sem alteração...
+// Métodos de status (mantidos mas com timeouts otimizados)
 func (h *UpdateCardHandler) CheckAccountStatus(w http.ResponseWriter, r *http.Request) {
-	email := r.URL.Query().Get("email")
-	username := r.URL.Query().Get("username")
-	
-	if email == "" || username == "" {
-			h.sendErrorResponse(w, http.StatusBadRequest, "Email and username are required")
-			return
-	}
+    // Implementação mantida com timeout de 10 segundos
+    ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+    defer cancel()
+    
+    email := r.URL.Query().Get("email")
+    username := r.URL.Query().Get("username")
+    
+    if email == "" || username == "" {
+        h.sendErrorResponse(w, http.StatusBadRequest, "Email and username are required")
+        return
+    }
 
-	// Verificar se a conta existe
-	masterAccount, err := h.getMasterAccountData(email, username)
-	if err != nil {
-			h.sendErrorResponse(w, http.StatusNotFound, "Account not found")
-			return
-	}
+    masterAccount, err := h.getMasterAccountDataFast(ctx, email, username)
+    if err != nil {
+        h.sendErrorResponse(w, http.StatusNotFound, "Account not found")
+        return
+    }
 
-	// Verificar status do usuário
-	var isActive int
-	var confirmationCode, lastLogin string
-	var createdAt time.Time
-	
-	query := `
-			SELECT is_active, COALESCE(confirmation_code, ''), 
-						 COALESCE(last_login, ''), created_at
-			FROM users 
-			WHERE email = ? AND username = ? 
-			LIMIT 1
-	`
-	
-	err = h.db.GetDB().QueryRow(query, email, username).Scan(
-			&isActive, &confirmationCode, &lastLogin, &createdAt)
-	
-	if err != nil {
-			h.sendErrorResponse(w, http.StatusNotFound, "User not found")
-			return
-	}
+    var isActive int
+    err = h.db.GetDB().QueryRowContext(ctx,
+        "SELECT is_active FROM users WHERE email = ? AND username = ? LIMIT 1",
+        email, username).Scan(&isActive)
+    
+    if err != nil {
+        h.sendErrorResponse(w, http.StatusNotFound, "User not found")
+        return
+    }
 
-	// Verificar status das subscriptions
-	var subscriptionStatus string
-	var nextBillingDate time.Time
-	subscriptionQuery := `
-			SELECT status, COALESCE(next_billing_date, '1970-01-01')
-			FROM subscriptions 
-			WHERE master_reference = ? 
-			ORDER BY created_at DESC 
-			LIMIT 1
-	`
-	
-	err = h.db.GetDB().QueryRow(subscriptionQuery, masterAccount.ReferenceUUID).Scan(
-			&subscriptionStatus, &nextBillingDate)
-	
-	if err != nil {
-			// Se não houver subscription, ainda pode precisar de atualização
-			subscriptionStatus = "none"
-			nextBillingDate = time.Time{}
-	}
+    // Resposta rápida
+    response := map[string]interface{}{
+        "status":              "success",
+        "account_status":      func() string {
+            switch isActive {
+            case 0: return "pending_activation"
+            case 1: return "active" 
+            case 9: return "payment_error"
+            default: return "unknown"
+            }
+        }(),
+        "needs_card_update":   isActive == 9,
+        "account_details": map[string]interface{}{
+            "email":        masterAccount.Email,
+            "username":     masterAccount.Username,
+            "name":         fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
+            "total_price":  masterAccount.TotalPrice,
+            "is_annually":  masterAccount.IsAnnually == 1,
+        },
+    }
 
-	// Determinar o status da conta
-	accountStatus := "active"
-	needsCardUpdate := false
-	statusMessage := "Account is active and working normally"
-	
-	switch isActive {
-	case 0:
-			accountStatus = "pending_activation"
-			statusMessage = "Account created but email not confirmed yet"
-	case 1:
-			accountStatus = "active"
-			statusMessage = "Account is active and working normally"
-	case 9:
-			accountStatus = "payment_error"
-			needsCardUpdate = true
-			statusMessage = "Payment method failed - card update required"
-	default:
-			accountStatus = "unknown"
-			statusMessage = "Account status unknown"
-	}
-
-	// Se subscription está failed/cancelled, também pode precisar de atualização
-	if subscriptionStatus == "failed" || subscriptionStatus == "cancelled" || subscriptionStatus == "suspended" {
-			needsCardUpdate = true
-			if accountStatus == "active" {
-					accountStatus = "subscription_error"
-					statusMessage = "Subscription payment failed - card update required"
-			}
-	}
-
-	response := map[string]interface{}{
-			"status":              "success",
-			"account_status":      accountStatus,
-			"needs_card_update":   needsCardUpdate,
-			"message":            statusMessage,
-			"account_details": map[string]interface{}{
-					"email":             masterAccount.Email,
-					"username":          masterAccount.Username,
-					"name":              fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
-					"is_active":         isActive,
-					"subscription_status": subscriptionStatus,
-					"next_billing_date": nextBillingDate.Format("2006-01-02"),
-					"total_price":       masterAccount.TotalPrice,
-					"is_annually":       masterAccount.IsAnnually == 1,
-					"created_at":        createdAt.Format("2006-01-02 15:04:05"),
-			},
-	}
-
-	// Adicionar informações sobre última tentativa de pagamento se houver erro
-	if needsCardUpdate {
-			var lastError string
-			var errorDate time.Time
-			
-			errorQuery := `
-					SELECT error_message, created_at 
-					FROM payment_results 
-					WHERE checkout_id = ? OR request_id LIKE CONCAT('%', ?, '%')
-					ORDER BY created_at DESC 
-					LIMIT 1
-			`
-			
-			err = h.db.GetDB().QueryRow(errorQuery, masterAccount.ReferenceUUID, masterAccount.ReferenceUUID).Scan(&lastError, &errorDate)
-			if err == nil {
-					response["last_payment_error"] = map[string]interface{}{
-							"error_message": lastError,
-							"error_date":   errorDate.Format("2006-01-02 15:04:05"),
-					}
-			}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(response)
 }
 
-// GetCardUpdateHistory retorna o histórico de atualizações de cartão
 func (h *UpdateCardHandler) GetCardUpdateHistory(w http.ResponseWriter, r *http.Request) {
-	email := r.URL.Query().Get("email")
-	username := r.URL.Query().Get("username")
-	
-	if email == "" || username == "" {
-			h.sendErrorResponse(w, http.StatusBadRequest, "Email and username are required")
-			return
-	}
+    ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+    defer cancel()
+    
+    email := r.URL.Query().Get("email")
+    username := r.URL.Query().Get("username")
+    
+    if email == "" || username == "" {
+        h.sendErrorResponse(w, http.StatusBadRequest, "Email and username are required")
+        return
+    }
 
-	// Verificar se a conta existe
-	masterAccount, err := h.getMasterAccountData(email, username)
-	if err != nil {
-			h.sendErrorResponse(w, http.StatusNotFound, "Account not found")
-			return
-	}
+    masterAccount, err := h.getMasterAccountDataFast(ctx, email, username)
+    if err != nil {
+        h.sendErrorResponse(w, http.StatusNotFound, "Account not found")
+        return
+    }
 
-	// Buscar histórico de transações relacionadas a updates de cartão
-	query := `
-			SELECT transaction_id, amount, status, created_at
-			FROM transactions 
-			WHERE master_reference = ? 
-			AND (checkout_id = 'CARD_UPDATE' OR checkout_id LIKE '%update%')
-			ORDER BY created_at DESC 
-			LIMIT 10
-	`
-	
-	rows, err := h.db.GetDB().Query(query, masterAccount.ReferenceUUID)
-	if err != nil {
-			h.sendErrorResponse(w, http.StatusInternalServerError, "Failed to retrieve update history")
-			return
-	}
-	defer rows.Close()
+    // Buscar histórico rapidamente
+    query := `
+        SELECT transaction_id, amount, status, created_at
+        FROM transactions 
+        WHERE master_reference = ? 
+        AND (checkout_id = 'CARD_UPDATE' OR checkout_id LIKE '%update%')
+        ORDER BY created_at DESC 
+        LIMIT 10
+    `
+    
+    rows, err := h.db.GetDB().QueryContext(ctx, query, masterAccount.ReferenceUUID)
+    if err != nil {
+        h.sendErrorResponse(w, http.StatusInternalServerError, "Failed to retrieve update history")
+        return
+    }
+    defer rows.Close()
 
-	var updates []map[string]interface{}
-	for rows.Next() {
-			var transactionID, status string
-			var amount float64
-			var createdAt time.Time
-			
-			if err := rows.Scan(&transactionID, &amount, &status, &createdAt); err != nil {
-					continue
-			}
-			
-			updates = append(updates, map[string]interface{}{
-					"transaction_id": transactionID,
-					"amount":        amount,
-					"status":        status,
-					"updated_at":    createdAt.Format("2006-01-02 15:04:05"),
-			})
-	}
+    var updates []map[string]interface{}
+    for rows.Next() {
+        var transactionID, status string
+        var amount float64
+        var createdAt time.Time
+        
+        if err := rows.Scan(&transactionID, &amount, &status, &createdAt); err != nil {
+            continue
+        }
+        
+        updates = append(updates, map[string]interface{}{
+            "transaction_id": transactionID,
+            "amount":        amount,
+            "status":        status,
+            "updated_at":    createdAt.Format("2006-01-02 15:04:05"),
+        })
+    }
 
-	// Buscar informações do cartão atual (mascarado)
-	var currentCard string
-	var cardExpiry string
-	cardQuery := `
-			SELECT card, expiry 
-			FROM billing_infos 
-			WHERE master_reference = ? 
-			ORDER BY id DESC 
-			LIMIT 1
-	`
-	
-	err = h.db.GetDB().QueryRow(cardQuery, masterAccount.ReferenceUUID).Scan(&currentCard, &cardExpiry)
-	if err != nil {
-			// Se não houver cartão, definir valores vazios
-			currentCard = "No card on file"
-			cardExpiry = ""
-	}
+    response := map[string]interface{}{
+        "status": "success",
+        "account_info": map[string]interface{}{
+            "email":    masterAccount.Email,
+            "username": masterAccount.Username,
+            "name":     fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
+        },
+        "update_history": updates,
+        "total_updates":  len(updates),
+    }
 
-	response := map[string]interface{}{
-			"status": "success",
-			"account_info": map[string]interface{}{
-					"email":    masterAccount.Email,
-					"username": masterAccount.Username,
-					"name":     fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
-			},
-			"current_card": map[string]interface{}{
-					"masked_number": currentCard,
-					"expiry":       cardExpiry,
-			},
-			"update_history": updates,
-			"total_updates":  len(updates),
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(response)
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(response)
 }

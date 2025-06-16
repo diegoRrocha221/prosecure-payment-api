@@ -24,13 +24,42 @@ import (
     "prosecure-payment-api/worker"
 )
 
+// NOVO: Middleware de timeout para todas as requests
+func timeoutMiddleware(timeout time.Duration) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            ctx, cancel := context.WithTimeout(r.Context(), timeout)
+            defer cancel()
+            
+            r = r.WithContext(ctx)
+            
+            done := make(chan struct{})
+            go func() {
+                defer close(done)
+                next.ServeHTTP(w, r)
+            }()
+            
+            select {
+            case <-done:
+                // Request completed normally
+            case <-ctx.Done():
+                // Request timed out
+                log.Printf("Request timeout: %s %s", r.Method, r.URL.Path)
+                if ctx.Err() == context.DeadlineExceeded {
+                    http.Error(w, "Request timeout", http.StatusRequestTimeout)
+                }
+            }
+        })
+    }
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
         w.Header().Set("Access-Control-Allow-Origin", "*")
         w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT")
         w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, Authorization, h-captcha-response")
         
-        // Responder imediatamente para OPTIONS
+        // OTIMIZADO: Responder imediatamente para OPTIONS
         if r.Method == "OPTIONS" {
             w.WriteHeader(http.StatusOK)
             return
@@ -56,18 +85,35 @@ func loggingMiddleware(next http.Handler) http.Handler {
         wrapper := &responseWriter{ResponseWriter: w, status: http.StatusOK}
         next.ServeHTTP(wrapper, r)
 
-        // Registrar apenas requisições com duração longa ou erros
         elapsed := time.Since(start)
-        if elapsed > 500*time.Millisecond || wrapper.status >= 400 {
+        
+        // OTIMIZADO: Log mais detalhado para operações de update-card
+        if r.URL.Path == "/api/update-card" || elapsed > 500*time.Millisecond || wrapper.status >= 400 {
             log.Printf(
-                "%s %s %s %d %v",
+                "%s %s %s %d %v %s",
                 r.Method,
                 r.RequestURI,
                 r.RemoteAddr,
                 wrapper.status,
                 elapsed,
+                r.UserAgent(),
             )
         }
+    })
+}
+
+// NOVO: Middleware para detectar conexões fechadas
+func connectionStateMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        // Verificar se a conexão ainda está ativa antes de processar
+        select {
+        case <-r.Context().Done():
+            log.Printf("Client disconnected before processing: %s %s", r.Method, r.URL.Path)
+            return
+        default:
+        }
+        
+        next.ServeHTTP(w, r)
     })
 }
 
@@ -134,10 +180,9 @@ func main() {
     if workerConcurrency < 2 {
         workerConcurrency = 2
     } else if workerConcurrency > 8 {
-        workerConcurrency = 8 // Limitar para evitar sobrecarga
+        workerConcurrency = 8
     }
     
-    // Criar worker com serviços completos para processamento assíncrono
     paymentWorker := worker.NewWorker(jobQueue, db, paymentService, emailService)
     paymentWorker.Start(workerConcurrency)
     defer paymentWorker.Stop()
@@ -163,54 +208,66 @@ func main() {
     cartHandler := handlers.NewCartHandler(db, cfg)
     checkoutHandler := handlers.NewCheckoutHandler(db)
     linkAccountHandler := handlers.NewLinkAccountHandler(db, cfg)
-    
-    // NOVO: Inicializar handler de atualização de cartão
     updateCardHandler := handlers.NewUpdateCardHandler(db, paymentService, emailService)
 
     // Configurar o router com middleware otimizados
     router := mux.NewRouter()
+    
+    // ORDEM IMPORTANTE dos middlewares:
     router.Use(corsMiddleware)
+    router.Use(connectionStateMiddleware) // NOVO: Detectar conexões fechadas
     router.Use(loggingMiddleware)
     
     api := router.PathPrefix("/api").Subrouter()
     
-    // Payment processing endpoints
-    api.HandleFunc("/process-payment", paymentHandler.ProcessPayment).Methods("POST", "OPTIONS")
-    api.HandleFunc("/check-payment-status", paymentHandler.CheckPaymentStatus).Methods("GET", "OPTIONS")
-    api.HandleFunc("/reset-checkout-status", paymentHandler.ResetCheckoutStatus).Methods("POST", "OPTIONS")
-    api.HandleFunc("/generate-checkout-id", paymentHandler.GenerateCheckoutID).Methods("GET")
-    api.HandleFunc("/update-checkout-id", paymentHandler.UpdateCheckoutID).Methods("POST")
-    api.HandleFunc("/check-checkout-status", paymentHandler.CheckCheckoutStatus).Methods("GET")
+    // NOVO: Aplicar timeout específico para diferentes endpoints
+    // Update card precisa de mais tempo
+    updateCardRouter := api.PathPrefix("/update-card").Subrouter()
+    updateCardRouter.Use(timeoutMiddleware(45 * time.Second)) // 45 segundos para update-card (reduzido de 90)
+    updateCardRouter.HandleFunc("", updateCardHandler.UpdateCard).Methods("POST", "OPTIONS")
     
-    // NOVO: Card update endpoints
-    api.HandleFunc("/update-card", updateCardHandler.UpdateCard).Methods("POST", "OPTIONS")
-    api.HandleFunc("/check-account-status", updateCardHandler.CheckAccountStatus).Methods("GET", "OPTIONS")
-    api.HandleFunc("/card-update-history", updateCardHandler.GetCardUpdateHistory).Methods("GET", "OPTIONS")
+    // Account status e history podem ser mais rápidos
+    statusRouter := api.PathPrefix("").Subrouter()
+    statusRouter.Use(timeoutMiddleware(15 * time.Second)) // 15 segundos para status
+    statusRouter.HandleFunc("/check-account-status", updateCardHandler.CheckAccountStatus).Methods("GET", "OPTIONS")
+    statusRouter.HandleFunc("/card-update-history", updateCardHandler.GetCardUpdateHistory).Methods("GET", "OPTIONS")
     
-    // Webhook endpoints
+    // Payment processing endpoints com timeout médio
+    paymentRouter := api.PathPrefix("").Subrouter()
+    paymentRouter.Use(timeoutMiddleware(60 * time.Second)) // 60 segundos para payment
+    paymentRouter.HandleFunc("/process-payment", paymentHandler.ProcessPayment).Methods("POST", "OPTIONS")
+    paymentRouter.HandleFunc("/check-payment-status", paymentHandler.CheckPaymentStatus).Methods("GET", "OPTIONS")
+    paymentRouter.HandleFunc("/reset-checkout-status", paymentHandler.ResetCheckoutStatus).Methods("POST", "OPTIONS")
+    paymentRouter.HandleFunc("/generate-checkout-id", paymentHandler.GenerateCheckoutID).Methods("GET")
+    paymentRouter.HandleFunc("/update-checkout-id", paymentHandler.UpdateCheckoutID).Methods("POST")
+    paymentRouter.HandleFunc("/check-checkout-status", paymentHandler.CheckCheckoutStatus).Methods("GET")
+    
+    // Webhook endpoints com timeout longo (podem receber dados grandes)
     webhookRouter := api.PathPrefix("/authorize-net/webhook").Subrouter()
+    webhookRouter.Use(timeoutMiddleware(30 * time.Second)) // 30 segundos para webhooks
     webhookRouter.HandleFunc("/silent-post", webhookHandler.HandleSilentPost).Methods("POST")
     webhookRouter.HandleFunc("/relay-response", webhookHandler.HandleRelayResponse).Methods("POST")
     webhookRouter.HandleFunc("/subscription-notification", webhookHandler.HandleSubscriptionNotification).Methods("POST")
     webhookRouter.HandleFunc("/store-payment-data", webhookHandler.StoreTemporaryPaymentData).Methods("POST")
     
-    // Other existing endpoints
-    api.HandleFunc("/checkout", checkoutHandler.UpdateCheckout).Methods("POST", "PUT", "OPTIONS")
-    api.HandleFunc("/checkout", checkoutHandler.GetCheckout).Methods("GET", "OPTIONS")
-    api.HandleFunc("/check-email-availability", checkoutHandler.CheckEmailAvailability).Methods("GET", "OPTIONS")
-    api.HandleFunc("/link-account", linkAccountHandler.LinkAccount).Methods("POST", "OPTIONS")
-    api.HandleFunc("/plans", planHandler.GetPlans).Methods("GET", "OPTIONS")
-    api.HandleFunc("/cart", cartHandler.AddToCart).Methods("POST", "OPTIONS")
-    api.HandleFunc("/cart", cartHandler.UpdateCart).Methods("PUT", "OPTIONS")
-    api.HandleFunc("/cart", cartHandler.GetCart).Methods("GET", "OPTIONS")
-    api.HandleFunc("/cart/remove", cartHandler.RemoveFromCart).Methods("POST", "OPTIONS")
+    // Other endpoints com timeout padrão
+    generalRouter := api.PathPrefix("").Subrouter()
+    generalRouter.Use(timeoutMiddleware(30 * time.Second)) // 30 segundos para endpoints gerais
+    generalRouter.HandleFunc("/checkout", checkoutHandler.UpdateCheckout).Methods("POST", "PUT", "OPTIONS")
+    generalRouter.HandleFunc("/checkout", checkoutHandler.GetCheckout).Methods("GET", "OPTIONS")
+    generalRouter.HandleFunc("/check-email-availability", checkoutHandler.CheckEmailAvailability).Methods("GET", "OPTIONS")
+    generalRouter.HandleFunc("/link-account", linkAccountHandler.LinkAccount).Methods("POST", "OPTIONS")
+    generalRouter.HandleFunc("/plans", planHandler.GetPlans).Methods("GET", "OPTIONS")
+    generalRouter.HandleFunc("/cart", cartHandler.AddToCart).Methods("POST", "OPTIONS")
+    generalRouter.HandleFunc("/cart", cartHandler.UpdateCart).Methods("PUT", "OPTIONS")
+    generalRouter.HandleFunc("/cart", cartHandler.GetCart).Methods("GET", "OPTIONS")
+    generalRouter.HandleFunc("/cart/remove", cartHandler.RemoveFromCart).Methods("POST", "OPTIONS")
 
     // Registrar hora de início para cálculo de uptime
     startTime := time.Now()
     
-    // Endpoint de health check
+    // Endpoint de health check (sem timeout - deve ser rápido)
     api.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-        // Criar contexto com timeout curto para health checks
         ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
         defer cancel()
         
@@ -252,19 +309,28 @@ func main() {
         json.NewEncoder(w).Encode(health)
     }).Methods("GET")
 
-    // Configurar servidor HTTP com timeouts otimizados
+    // OTIMIZADO: Configurar servidor HTTP com timeouts mais agressivos
     srv := &http.Server{
         Addr:         fmt.Sprintf(":%s", cfg.Server.Port),
         Handler:      router,
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,  // Aumentado para comportar operações mais longas
-        IdleTimeout:  120 * time.Second, // Dobrado para manter conexões ativas por mais tempo
-        MaxHeaderBytes: 1 << 20,         // 1MB para cabeçalhos (default é 1MB)
+        ReadTimeout:  30 * time.Second,   // REDUZIDO: 30 segundos para ler request
+        WriteTimeout: 120 * time.Second,  // AUMENTADO: 120 segundos para escrever response
+        IdleTimeout:  300 * time.Second,  // AUMENTADO: 5 minutos para conexões idle
+        
+        // NOVO: Configurações adicionais para otimização
+        ReadHeaderTimeout: 10 * time.Second,  // 10 segundos para ler headers
+        MaxHeaderBytes:    1 << 20,           // 1MB para headers
+        
+        // NOVO: Configurar error log customizado
+        ErrorLog: log.New(os.Stderr, "HTTP Server Error: ", log.LstdFlags),
     }
 
     // Iniciar servidor em goroutine separada
     go func() {
-        log.Printf("Server starting on port %s", cfg.Server.Port)
+        log.Printf("Server starting on port %s with optimized timeouts", cfg.Server.Port)
+        log.Printf("Timeouts configured: Read=%v, Write=%v, Idle=%v", 
+            srv.ReadTimeout, srv.WriteTimeout, srv.IdleTimeout)
+        
         if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
             log.Fatalf("Server error: %v", err)
         }
@@ -279,7 +345,7 @@ func main() {
     log.Println("Shutdown signal received, gracefully shutting down...")
 
     // Criar contexto com timeout para encerramento
-    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
     defer shutdownCancel()
 
     // Primeiro encerrar o HTTP server
