@@ -182,18 +182,10 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // ETAPA 5: Enviar email de confirmação
-    log.Printf("[UpdateCard %s] Step 5: Sending confirmation email", requestID)
-    
-    if err := h.sendCardUpdateConfirmationEmail(req.Email, masterAccount.Name); err != nil {
-        log.Printf("[UpdateCard %s] Warning: Failed to send confirmation email: %v", requestID, err)
-        // Não falha o processo por causa do email
-    }
-
     log.Printf("[UpdateCard %s] Card update process completed successfully", requestID)
 
-    // Resposta de sucesso
-    h.sendSuccessResponse(w, UpdateCardResponse{
+    // CORREÇÃO: Enviar resposta HTTP IMEDIATAMENTE antes do email
+    response := UpdateCardResponse{
         Status:  "success",
         Message: "Card updated successfully and recurring billing reactivated",
         Success: true,
@@ -202,7 +194,22 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
             "account_status": "active",
             "updated_at":     time.Now().Format("2006-01-02 15:04:05"),
         },
-    })
+    }
+    
+    h.sendSuccessResponse(w, response)
+    log.Printf("[UpdateCard %s] HTTP response sent successfully", requestID)
+
+    // ETAPA 5: Enviar email de confirmação de forma ASSÍNCRONA após a resposta
+    go func() {
+        emailStart := time.Now()
+        log.Printf("[UpdateCard %s] Step 5: Sending confirmation email (async)", requestID)
+        
+        if err := h.sendCardUpdateConfirmationEmail(req.Email, masterAccount.Name); err != nil {
+            log.Printf("[UpdateCard %s] Warning: Failed to send confirmation email: %v", requestID, err)
+        } else {
+            log.Printf("[UpdateCard %s] Confirmation email sent successfully in %v", requestID, time.Since(emailStart))
+        }
+    }()
 }
 
 // getMasterAccountData busca os dados da conta master
@@ -482,6 +489,7 @@ func (h *UpdateCardHandler) sendSuccessResponse(w http.ResponseWriter, response 
     json.NewEncoder(w).Encode(response)
 }
 
+// Métodos adicionais mantidos sem alteração...
 func (h *UpdateCardHandler) CheckAccountStatus(w http.ResponseWriter, r *http.Request) {
 	email := r.URL.Query().Get("email")
 	username := r.URL.Query().Get("username")
