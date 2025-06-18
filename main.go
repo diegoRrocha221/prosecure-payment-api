@@ -265,13 +265,12 @@ func main() {
     internalRouter := api.PathPrefix("/internal").Subrouter()
     internalRouter.Use(timeoutMiddleware(15 * time.Second))
     
-    // Endpoints internos (requer secret)
-    internalRouter.HandleFunc("/generate-token", internalHandler.requireInternalSecret(internalHandler.GenerateTokenForUser)).Methods("POST", "OPTIONS")
-    internalRouter.HandleFunc("/validate-token", internalHandler.requireInternalSecret(internalHandler.ValidateTokenInternal)).Methods("POST", "OPTIONS")
-    internalRouter.HandleFunc("/refresh-token", internalHandler.requireInternalSecret(internalHandler.RefreshTokenInternal)).Methods("POST", "OPTIONS")
-    internalRouter.HandleFunc("/user-by-token", internalHandler.requireInternalSecret(internalHandler.GetUserByToken)).Methods("GET", "OPTIONS")
-    internalRouter.HandleFunc("/health", internalHandler.requireInternalSecret(internalHandler.InternalHealthCheck)).Methods("GET", "OPTIONS")
-
+    // Endpoints internos (requer secret) - CORRIGIDO
+    internalRouter.HandleFunc("/generate-token", internalHandler.RequireInternalSecret(internalHandler.GenerateTokenForUser)).Methods("POST", "OPTIONS")
+    internalRouter.HandleFunc("/validate-token", internalHandler.RequireInternalSecret(internalHandler.ValidateTokenInternal)).Methods("POST", "OPTIONS")
+    internalRouter.HandleFunc("/refresh-token", internalHandler.RequireInternalSecret(internalHandler.RefreshTokenInternal)).Methods("POST", "OPTIONS")
+    internalRouter.HandleFunc("/user-by-token", internalHandler.RequireInternalSecret(internalHandler.GetUserByToken)).Methods("GET", "OPTIONS")
+    internalRouter.HandleFunc("/health", internalHandler.RequireInternalSecret(internalHandler.InternalHealthCheck)).Methods("GET", "OPTIONS")
     // ===========================================
     // ROTAS PROTEGIDAS (COM AUTENTICAÇÃO)
     // ===========================================

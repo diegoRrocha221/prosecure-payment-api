@@ -180,12 +180,7 @@ func (h *ProtectedPaymentHandler) AddPlan(w http.ResponseWriter, r *http.Request
         return
     }
 
-    // Buscar conta master
-    masterAccount, err := h.getMasterAccountByUser(user.Username, user.Email)
-    if err != nil {
-        utils.SendErrorResponse(w, http.StatusNotFound, "Master account not found")
-        return
-    }
+
 
     // Calcular preço
     planPrice := plan.Price
@@ -211,7 +206,6 @@ func (h *ProtectedPaymentHandler) AddPlan(w http.ResponseWriter, r *http.Request
     })
 }
 
-// GetAccountDetails - Retorna detalhes da conta autenticada
 func (h *ProtectedPaymentHandler) GetAccountDetails(w http.ResponseWriter, r *http.Request) {
     user := middleware.GetUserFromContext(r.Context())
     if user == nil {
@@ -221,7 +215,8 @@ func (h *ProtectedPaymentHandler) GetAccountDetails(w http.ResponseWriter, r *ht
 
     // Buscar conta master se for master account
     if user.IsMaster {
-        masterAccount, err := h.getMasterAccountByUser(user.Username, user.Email)
+        // CORREÇÃO: Removida declaração desnecessária de masterAccount que não estava sendo usada
+        masterAccountData, err := h.getMasterAccountByUser(user.Username, user.Email)
         if err != nil {
             log.Printf("Error getting master account details: %v", err)
             utils.SendErrorResponse(w, http.StatusInternalServerError, "Error retrieving account details")
@@ -246,22 +241,22 @@ func (h *ProtectedPaymentHandler) GetAccountDetails(w http.ResponseWriter, r *ht
         }
 
         accountDetails := map[string]interface{}{
-            "username":          masterAccount.Username,
-            "email":             masterAccount.Email,
-            "name":              fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
-            "phone_number":      masterAccount.PhoneNumber,
-            "total_price":       masterAccount.TotalPrice,
-            "is_annually":       masterAccount.IsAnnually == 1,
-            "simultaneous_users": masterAccount.SimultaneousUsers,
-            "renew_date":        masterAccount.RenewDate.Format("2006-01-02"),
+            "username":          masterAccountData.Username,
+            "email":             masterAccountData.Email,
+            "name":              fmt.Sprintf("%s %s", masterAccountData.Name, masterAccountData.LastName),
+            "phone_number":      masterAccountData.PhoneNumber,
+            "total_price":       masterAccountData.TotalPrice,
+            "is_annually":       masterAccountData.IsAnnually == 1,
+            "simultaneous_users": masterAccountData.SimultaneousUsers,
+            "renew_date":        masterAccountData.RenewDate.Format("2006-01-02"),
             "masked_card":       maskedCard,
             "next_billing":      nil,
             "address": map[string]string{
-                "street":     masterAccount.Street,
-                "city":       masterAccount.City,
-                "state":      masterAccount.State,
-                "zip_code":   masterAccount.ZipCode,
-                "additional": masterAccount.AdditionalInfo,
+                "street":     masterAccountData.Street,
+                "city":       masterAccountData.City,
+                "state":      masterAccountData.State,
+                "zip_code":   masterAccountData.ZipCode,
+                "additional": masterAccountData.AdditionalInfo,
             },
         }
 
@@ -288,7 +283,6 @@ func (h *ProtectedPaymentHandler) GetAccountDetails(w http.ResponseWriter, r *ht
         })
     }
 }
-
 // GetPaymentHistory - Retorna histórico de pagamentos
 func (h *ProtectedPaymentHandler) GetPaymentHistory(w http.ResponseWriter, r *http.Request) {
     user := middleware.GetUserFromContext(r.Context())

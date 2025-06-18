@@ -22,7 +22,7 @@ type InternalHandler struct {
 func NewInternalHandler(jwtService *auth.JWTService) *InternalHandler {
     internalSecret := os.Getenv("INTERNAL_API_SECRET")
     if internalSecret == "" {
-        internalSecret = "your_internal_api_secret" // Fallback para desenvolvimento
+        internalSecret = "LSP0197O81r73a8Pd57c39ER3fu11cadSec4fb83d91" // Fallback para desenvolvimento
     }
     
     return &InternalHandler{
@@ -31,8 +31,8 @@ func NewInternalHandler(jwtService *auth.JWTService) *InternalHandler {
     }
 }
 
-// Middleware para verificar secret interno
-func (h *InternalHandler) requireInternalSecret(next http.HandlerFunc) http.HandlerFunc {
+// RequireInternalSecret - Middleware para verificar secret interno (corrigido)
+func (h *InternalHandler) RequireInternalSecret(next http.HandlerFunc) http.HandlerFunc {
     return func(w http.ResponseWriter, r *http.Request) {
         secret := r.Header.Get("X-Internal-Secret")
         if secret == "" || secret != h.internalSecret {
