@@ -187,7 +187,6 @@ type ARBSubscriptionTypeWithProfile struct {
     PaymentSchedule PaymentScheduleType `json:"paymentSchedule"`
     Amount         string             `json:"amount"`
     Profile        ProfileType        `json:"profile"`
-    Order          OrderType          `json:"order"`
     Customer       CustomerType       `json:"customer"`
     BillTo         CustomerAddressType `json:"billTo"`
 }
@@ -201,9 +200,9 @@ type ProfileType struct {
 
 // ARBSubscriptionRequestWithProfile é a requisição ARB usando Customer Profile
 type ARBSubscriptionRequestWithProfile struct {
-    MerchantAuthentication merchantAuthenticationType     `json:"merchantAuthentication"`
-    RefID                 string                        `json:"refId"`
-    Subscription         ARBSubscriptionTypeWithProfile `json:"subscription"`
+    MerchantAuthentication merchantAuthenticationType             `json:"merchantAuthentication"`
+    RefID                 string                                  `json:"refId"`
+    Subscription         ARBSubscriptionTypeWithProfile           `json:"subscription"`
 }
 
 // GetCustomerProfileRequest para buscar um perfil existente
