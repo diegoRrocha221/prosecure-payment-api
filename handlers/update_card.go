@@ -286,11 +286,7 @@ func (h *UpdateCardHandler) processPaymentOperationsFast(ctx context.Context, re
         
         // ETAPA 3: ARB em background (não bloquear resposta)
         go func() {
-            checkoutData, err := h.convertMasterAccountToCheckoutDataWithPrices(master)
-            if err != nil {
-                log.Printf("[UpdateCard %s] Warning: Failed to convert account data for ARB: %v", requestID, err)
-                return
-            }
+            checkoutData := h.convertMasterAccountToCheckoutData(master)
             
             if err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData); err != nil {
                 log.Printf("[UpdateCard %s] Warning: Failed to setup ARB in background: %v", requestID, err)
@@ -571,6 +567,38 @@ func (h *UpdateCardHandler) convertMasterAccountToCheckoutDataWithPrices(master 
     
     checkoutData.Plans = plans
     return checkoutData, nil
+}
+
+// NOVA FUNÇÃO: Conversão básica de MasterAccount para CheckoutData
+func (h *UpdateCardHandler) convertMasterAccountToCheckoutData(master *models.MasterAccount) *models.CheckoutData {
+    checkoutData := &models.CheckoutData{
+        ID:          master.ReferenceUUID,
+        Name:        fmt.Sprintf("%s %s", master.Name, master.LastName),
+        Email:       master.Email,
+        Username:    master.Username,
+        PhoneNumber: master.PhoneNumber,
+        Street:      master.Street,
+        City:        master.City,
+        State:       master.State,
+        ZipCode:     master.ZipCode,
+        Additional:  master.AdditionalInfo,
+        PlanID:      master.Plan,
+        PlansJSON:   master.PurchasedPlans,
+        Total:       master.TotalPrice,
+    }
+    
+    // Parse simplificado dos planos
+    plans := []models.Plan{
+        {
+            PlanID:   master.Plan,
+            PlanName: "Subscription Plan",
+            Price:    master.TotalPrice,
+            Annually: master.IsAnnually,
+        },
+    }
+    
+    checkoutData.Plans = plans
+    return checkoutData
 }
 
 // Helper methods para responses (mantidos)

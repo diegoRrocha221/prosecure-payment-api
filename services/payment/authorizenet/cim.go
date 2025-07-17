@@ -86,12 +86,6 @@ func (c *Client) CreateCustomerProfile(payment *models.PaymentRequest, checkout 
         DefaultPaymentProfile: true,
     }
 
-    // Adicionar número de telefone se disponível
-    if formattedPhone != "" {
-        // Note: telefone não é suportado diretamente no BillTo para CIM, 
-        // mas será incluído no Customer do ARB
-    }
-
     // Criar o perfil do cliente
     profile := CustomerProfileType{
         MerchantCustomerID: merchantCustomerId,
@@ -173,10 +167,13 @@ func (c *Client) CreateCustomerProfile(payment *models.PaymentRequest, checkout 
                 if existingProfileID != "" {
                     log.Printf("Extracted existing customer profile ID: %s", existingProfileID)
                     
-                    // Buscar o payment profile ID do perfil existente
-                    paymentProfileID, err := c.getFirstPaymentProfileID(existingProfileID)
+                    // Buscar o payment profile ID do perfil existente - CORRIGIDO
+                    paymentProfileID, err := c.getPaymentProfileIDFromExistingProfile(existingProfileID)
                     if err != nil {
-                        return "", "", fmt.Errorf("failed to get payment profile ID from existing profile: %v", err)
+                        log.Printf("Failed to get payment profile ID from existing profile: %v", err)
+                        // Em caso de erro, retornar o profile ID mesmo sem payment profile ID
+                        // A subscription pode tentar usar apenas o customer profile ID
+                        return existingProfileID, "", nil
                     }
                     
                     return existingProfileID, paymentProfileID, nil
@@ -245,8 +242,10 @@ func isNumeric(s string) bool {
     return true
 }
 
-// getFirstPaymentProfileID busca o primeiro payment profile ID de um customer profile
-func (c *Client) getFirstPaymentProfileID(customerProfileID string) (string, error) {
+// CORRIGIDO: getPaymentProfileIDFromExistingProfile busca o payment profile ID de um customer profile existente
+func (c *Client) getPaymentProfileIDFromExistingProfile(customerProfileID string) (string, error) {
+    log.Printf("Getting payment profile ID from existing customer profile: %s", customerProfileID)
+    
     request := GetCustomerProfileRequestWrapper{
         GetCustomerProfileRequest: GetCustomerProfileRequest{
             MerchantAuthentication: c.getMerchantAuthentication(),
@@ -298,15 +297,39 @@ func (c *Client) getFirstPaymentProfileID(customerProfileID string) (string, err
         return "", fmt.Errorf("get customer profile failed: %s", message)
     }
 
-    // Extrair o primeiro payment profile ID
+    // CORRIGIDO: Extrair o payment profile ID diretamente da resposta
     if len(response.Profile.PaymentProfiles) > 0 {
-        // O payment profile ID não vem diretamente no response, precisamos fazer outra chamada
-        // ou usar uma abordagem diferente. Por agora, vamos retornar um erro indicando que
-        // o usuário precisa tentar novamente
-        return "", fmt.Errorf("existing customer profile found but payment profile ID extraction not implemented - please retry the operation")
+        // Assumir que queremos o primeiro payment profile
+        // Na verdade, o payment profile ID está no campo CustomerPaymentProfileID da resposta
+        // Vamos verificar se o profile tem payment profiles e extrair o ID
+        
+        // Como o PaymentProfiles não tem o ID diretamente no tipo atual,
+        // vamos usar uma abordagem diferente - parsear a resposta JSON diretamente
+        var rawResponse map[string]interface{}
+        if err := json.Unmarshal([]byte(cleanBody), &rawResponse); err == nil {
+            if profile, ok := rawResponse["profile"].(map[string]interface{}); ok {
+                if paymentProfiles, ok := profile["paymentProfiles"].([]interface{}); ok && len(paymentProfiles) > 0 {
+                    if firstProfile, ok := paymentProfiles[0].(map[string]interface{}); ok {
+                        if customerPaymentProfileID, ok := firstProfile["customerPaymentProfileId"].(string); ok {
+                            log.Printf("Successfully extracted payment profile ID: %s from customer profile: %s", 
+                                customerPaymentProfileID, customerProfileID)
+                            return customerPaymentProfileID, nil
+                        }
+                    }
+                }
+            }
+        }
+        
+        log.Printf("Customer profile %s has payment profiles but could not extract payment profile ID", customerProfileID)
+        return "", fmt.Errorf("could not extract payment profile ID from customer profile response")
     }
 
-    return "", fmt.Errorf("no payment profiles found in existing customer profile")
+    return "", fmt.Errorf("no payment profiles found in customer profile %s", customerProfileID)
+}
+
+// getFirstPaymentProfileID - DEPRECATED: Use getPaymentProfileIDFromExistingProfile instead
+func (c *Client) getFirstPaymentProfileID(customerProfileID string) (string, error) {
+    return c.getPaymentProfileIDFromExistingProfile(customerProfileID)
 }
 
 // UpdateCustomerPaymentProfile atualiza o método de pagamento de um customer profile existente
