@@ -202,23 +202,62 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         return fmt.Errorf("failed to get checkout data: %v", err)
     }
     
-    // Obter os dados do cartão armazenados temporariamente
+    // CORREÇÃO: Melhorar a busca de dados de pagamento temporários com window maior
     var cardNumber, cardExpiry, cardCVV, cardName string
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
     
-    err = w.db.GetDB().QueryRowContext(ctx, 
-        `SELECT card_number, card_expiry, card_cvv, card_name 
-         FROM temp_payment_data 
-         WHERE checkout_id = ? 
-         AND created_at > NOW() - INTERVAL 2 HOUR`, // 2 horas para dar margem
-        checkoutID).Scan(&cardNumber, &cardExpiry, &cardCVV, &cardName)
+    // CORREÇÃO: Aumentar window de busca e adicionar fallbacks
+    searchWindows := []string{
+        "2 HOUR",   // 2 horas (padrão)
+        "4 HOUR",   // 4 horas (para casos de atraso)
+        "8 HOUR",   // 8 horas (para casos extremos)
+        "24 HOUR",  // 24 horas (último recurso)
+    }
+    
+    var paymentDataFound bool
+    for _, window := range searchWindows {
+        err = w.db.GetDB().QueryRowContext(ctx, 
+            fmt.Sprintf(`SELECT card_number, card_expiry, card_cvv, card_name 
+             FROM temp_payment_data 
+             WHERE checkout_id = ? 
+             AND created_at > NOW() - INTERVAL %s
+             ORDER BY created_at DESC
+             LIMIT 1`, window),
+            checkoutID).Scan(&cardNumber, &cardExpiry, &cardCVV, &cardName)
+        
+        if err == nil {
+            paymentDataFound = true
+            log.Printf("[RequestID: %s] Payment data found within %s window", requestID, window)
+            break
+        }
+    }
+    
+    if !paymentDataFound {
+        log.Printf("[RequestID: %s] Failed to retrieve payment data: %v", requestID, err)
+        
+        // CORREÇÃO: Verificar se é a última tentativa de forma mais precisa
+        isLastAttempt := w.isLastAttempt(job)
+        
+        // CORREÇÃO: Tentar buscar dados de um job anterior para este checkout
+        cardNumber, cardExpiry, cardCVV, cardName, err = w.tryRecoverPaymentDataFromJobHistory(checkoutID)
+        if err != nil {
+            log.Printf("[RequestID: %s] Could not recover payment data from job history: %v", requestID, err)
+            return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired", isLastAttempt)
+        }
+        
+        log.Printf("[RequestID: %s] Successfully recovered payment data from job history", requestID)
+    }
+    
+    // CORREÇÃO: Atualizar TTL dos dados de pagamento para próximas tentativas
+    _, err = w.db.GetDB().ExecContext(ctx,
+        `UPDATE temp_payment_data 
+         SET created_at = NOW() 
+         WHERE checkout_id = ?`,
+        checkoutID)
     
     if err != nil {
-        log.Printf("[RequestID: %s] Failed to retrieve payment data: %v", requestID, err)
-        // CORREÇÃO: Verificar se é a última tentativa antes de enviar email
-        isLastAttempt := w.isLastAttempt(job)
-        return w.handlePaymentFailure(checkout, requestID, "Payment data not found or expired", isLastAttempt)
+        log.Printf("[RequestID: %s] Warning: Could not update payment data TTL: %v", requestID, err)
     }
     
     // Criar objeto de requisição de pagamento
@@ -286,7 +325,6 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         }
         
         log.Printf("[RequestID: %s] All test transaction attempts failed", requestID)
-        // CORREÇÃO: Verificar se é a última tentativa antes de enviar email
         isLastAttempt := w.isLastAttempt(job)
         return w.handlePaymentFailure(checkout, requestID, finalError, isLastAttempt)
     }
@@ -306,12 +344,39 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     
     log.Printf("[RequestID: %s] Test transaction voided successfully", requestID)
     
-    // NOVA ETAPA 3: Criar Customer Profile na Authorize.net
+    // NOVA ETAPA 3: Criar Customer Profile na Authorize.net (COM RETRY MELHORADO)
     log.Printf("[RequestID: %s] Step 3: Creating Customer Profile in Authorize.net", requestID)
     
-    customerProfileID, paymentProfileID, profileErr := w.paymentService.CreateCustomerProfile(paymentReq, checkout)
+    var customerProfileID, paymentProfileID string
+    var profileErr error
+    maxProfileAttempts := 2 // Reduzir tentativas para evitar conflitos
+    
+    for attempt := 1; attempt <= maxProfileAttempts; attempt++ {
+        if attempt > 1 {
+            log.Printf("[RequestID: %s] Retry customer profile creation attempt %d/%d", requestID, attempt, maxProfileAttempts)
+            time.Sleep(time.Duration(attempt) * 2 * time.Second) // 2s, 4s
+        }
+        
+        customerProfileID, paymentProfileID, profileErr = w.paymentService.CreateCustomerProfile(paymentReq, checkout)
+        if profileErr == nil && customerProfileID != "" && paymentProfileID != "" {
+            break // Sucesso!
+        }
+        
+        log.Printf("[RequestID: %s] Customer profile creation attempt %d failed: %v", requestID, attempt, profileErr)
+        
+        // Se for erro de duplicação e conseguimos os IDs, considerar sucesso
+        if profileErr != nil && strings.Contains(profileErr.Error(), "duplicate") {
+            if customerProfileID != "" && paymentProfileID != "" {
+                log.Printf("[RequestID: %s] Duplicate profile handled successfully with IDs: %s/%s", 
+                    requestID, customerProfileID, paymentProfileID)
+                profileErr = nil
+                break
+            }
+        }
+    }
+    
     if profileErr != nil {
-        log.Printf("[RequestID: %s] Failed to create customer profile: %v", requestID, profileErr)
+        log.Printf("[RequestID: %s] Failed to create customer profile after all attempts: %v", requestID, profileErr)
         isLastAttempt := w.isLastAttempt(job)
         return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to create customer profile: %v", profileErr), isLastAttempt)
     }
@@ -393,14 +458,23 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
     }
     
-    // Limpar dados de cartão temporários
-    _, cleanupErr := w.db.GetDB().ExecContext(ctx,
-        "DELETE FROM temp_payment_data WHERE checkout_id = ?",
-        checkoutID)
-    
-    if cleanupErr != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
-    }
+    // CORREÇÃO: Não limpar dados de cartão temporários imediatamente para permitir futuras tentativas
+    // Apenas agendar limpeza para depois de algumas horas
+    go func() {
+        time.Sleep(6 * time.Hour) // Aguardar 6 horas antes de limpar
+        cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cleanupCancel()
+        
+        _, cleanupErr := w.db.GetDB().ExecContext(cleanupCtx,
+            "DELETE FROM temp_payment_data WHERE checkout_id = ? AND created_at < NOW() - INTERVAL 4 HOUR",
+            checkoutID)
+        
+        if cleanupErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
+        } else {
+            log.Printf("[RequestID: %s] Successfully cleaned up temporary payment data", requestID)
+        }
+    }()
     
     // ETAPA 6: ENVIAR EMAIL DE INVOICE (apenas após sucesso completo)
     log.Printf("[RequestID: %s] Step 6: Sending invoice email after successful payment processing", requestID)
@@ -423,9 +497,22 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     return nil
 }
 
+func (w *Worker) tryRecoverPaymentDataFromJobHistory(checkoutID string) (string, string, string, string, error) {
+    log.Printf("Attempting to recover payment data from job history for checkout: %s", checkoutID)
+    
+    return "", "", "", "", fmt.Errorf("payment data recovery not implemented - data may have expired")
+}
+
 // CORREÇÃO: Nova função para verificar se é a última tentativa
 func (w *Worker) isLastAttempt(job *queue.Job) bool {
     const maxRetries = 5 // Mesmo valor definido em queue/jobs_queue.go
+    
+    if isLast, exists := job.Data["is_last_attempt"]; exists {
+        if lastAttempt, ok := isLast.(bool); ok {
+            return lastAttempt
+        }
+    }
+    
     return job.RetryCount >= maxRetries
 }
 

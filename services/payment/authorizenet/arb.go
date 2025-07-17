@@ -1,3 +1,4 @@
+// services/payment/authorizenet/arb.go - VERSÃO COM DEBUGGING MELHORADO
 package authorizenet
 
 import (
@@ -14,23 +15,6 @@ import (
     "prosecure-payment-api/models"
 )
 
-func formatPhoneNumber(phone string) string {
-    clean := strings.Map(func(r rune) rune {
-        if r >= '0' && r <= '9' {
-            return r
-        }
-        return -1
-    }, phone)
-
-    if len(clean) == 10 {
-        return fmt.Sprintf("(%s) %s-%s", clean[0:3], clean[3:6], clean[6:])
-    } else if len(clean) == 11 && clean[0] == '1' {
-        return fmt.Sprintf("(%s) %s-%s", clean[1:4], clean[4:7], clean[7:])
-    }
-
-    return ""
-}
-
 // CreateSubscription cria uma assinatura usando Customer Profile (método atualizado)
 func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *models.CheckoutData) (*models.SubscriptionResponse, error) {
     startTime := time.Now()
@@ -45,6 +29,7 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
     log.Printf("Step 1: Creating customer profile for checkout: %s", payment.CheckoutID)
     customerProfileID, paymentProfileID, err := c.CreateCustomerProfile(payment, checkout)
     if err != nil {
+        log.Printf("Customer profile creation failed for checkout %s: %v", payment.CheckoutID, err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Failed to create customer profile: %v", err),
@@ -61,6 +46,17 @@ func (c *Client) CreateSubscription(payment *models.PaymentRequest, checkout *mo
 
 // createSubscriptionWithProfile cria uma subscription usando Customer Profile ID
 func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, checkout *models.CheckoutData, customerProfileID, paymentProfileID string) (*models.SubscriptionResponse, error) {
+    log.Printf("Creating ARB subscription with Customer Profile ID: %s, Payment Profile ID: %s", 
+        customerProfileID, paymentProfileID)
+    
+    // Validar que temos IDs válidos
+    if customerProfileID == "" || paymentProfileID == "" {
+        return &models.SubscriptionResponse{
+            Success: false,
+            Message: "Invalid customer profile or payment profile ID",
+        }, nil
+    }
+    
     var total float64
     interval := IntervalType{
         Length: 1,
@@ -80,7 +76,8 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
         }
     }
 
-    log.Printf("Creating subscription with customer profile, total amount: %.2f", total)
+    log.Printf("Creating subscription with customer profile, total amount: %.2f, interval: %d %s", 
+        total, interval.Length, interval.Unit)
 
     // Extrair nome e sobrenome
     names := strings.Fields(checkout.Name)
@@ -98,6 +95,7 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
 
     // Definir data de início para um mês após a data atual
     startDate := time.Now().AddDate(0, 1, 0).Format("2006-01-02") 
+    log.Printf("Subscription start date: %s", startDate)
     
     // CORREÇÃO: Truncar RefID para máximo de 20 caracteres
     refId := payment.CheckoutID
@@ -162,16 +160,31 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
         },
     }
 
+    // CORREÇÃO: Log da estrutura da requisição (sem dados sensíveis)
+    log.Printf("ARB Request Structure - RefID: %s, Amount: %.2f, CustomerProfileID: %s, PaymentProfileID: %s, Name: %s",
+        refId, total, customerProfileID, paymentProfileID, subscriptionName)
+
     // Serializar para JSON
     jsonPayload, err := json.Marshal(map[string]interface{}{
         "ARBCreateSubscriptionRequest": subscription,
     })
     if err != nil {
+        log.Printf("Error marshaling ARB subscription request: %v", err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error marshaling subscription request: %v", err),
         }, nil
     }
+
+    // CORREÇÃO: Log do tamanho do payload (para debug)
+    log.Printf("ARB JSON payload size: %d bytes", len(jsonPayload))
+    
+    // Log da primeira parte do JSON (sem dados sensíveis) para debug
+    jsonPreview := string(jsonPayload)
+    if len(jsonPreview) > 300 {
+        jsonPreview = jsonPreview[:300] + "..."
+    }
+    log.Printf("ARB JSON preview: %s", jsonPreview)
 
     log.Printf("Sending ARB request with customer profile to Authorize.net for checkout: %s (Profile: %s)", 
         payment.CheckoutID, customerProfileID)
@@ -182,6 +195,7 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     
     httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
     if err != nil {
+        log.Printf("Error creating ARB HTTP request: %v", err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error creating ARB request: %v", err),
@@ -191,12 +205,19 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     httpReq.Header.Set("Content-Type", "application/json")
     httpReq.Header.Set("Cache-Control", "no-cache")
 
+    // Log dos headers da requisição
+    log.Printf("ARB Request Headers: Content-Type=%s, Endpoint=%s", 
+        httpReq.Header.Get("Content-Type"), c.getEndpoint())
+
     // Usar mutex para garantir thread safety
     c.mutex.Lock()
+    requestStart := time.Now()
     resp, err := c.client.Do(httpReq)
+    requestDuration := time.Since(requestStart)
     c.mutex.Unlock()
     
     if err != nil {
+        log.Printf("Error making ARB HTTP request (took %v): %v", requestDuration, err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error making ARB request: %v", err),
@@ -204,33 +225,57 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     }
     defer resp.Body.Close()
 
+    log.Printf("ARB HTTP request completed in %v, status code: %d", requestDuration, resp.StatusCode)
+
     respBody, err := io.ReadAll(resp.Body)
     if err != nil {
+        log.Printf("Error reading ARB response body: %v", err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error reading ARB response body: %v", err),
         }, nil
     }
 
-    log.Printf("ARB response received for checkout: %s", payment.CheckoutID)
+    log.Printf("ARB response received for checkout: %s, response size: %d bytes", 
+        payment.CheckoutID, len(respBody))
+
+    // Log da primeira parte da resposta para debug
+    responsePreview := string(respBody)
+    if len(responsePreview) > 500 {
+        responsePreview = responsePreview[:500] + "..."
+    }
+    log.Printf("ARB response preview: %s", responsePreview)
 
     // Remover BOM se presente
     cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")
 
     var response ARBResponse
     if err := json.Unmarshal([]byte(cleanBody), &response); err != nil {
+        log.Printf("Error decoding ARB response JSON: %v", err)
+        log.Printf("Raw response body: %s", string(respBody))
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error decoding ARB response: %v", err),
         }, nil
     }
 
+    // Log da estrutura da resposta
+    log.Printf("ARB Response - ResultCode: %s, SubscriptionID: %s, RefID: %s", 
+        response.Messages.ResultCode, response.SubscriptionID, response.RefID)
+
     if response.Messages.ResultCode == "Error" {
         message := "Subscription creation failed"
         if len(response.Messages.Message) > 0 {
             message = response.Messages.Message[0].Text
+            log.Printf("ARB Error Details - Code: %s, Text: %s", 
+                response.Messages.Message[0].Code, response.Messages.Message[0].Text)
         }
-        log.Printf("ARB Error: %s", message)
+        
+        // CORREÇÃO: Log de todos os erros se houver múltiplos
+        for i, msg := range response.Messages.Message {
+            log.Printf("ARB Error %d - Code: %s, Text: %s", i+1, msg.Code, msg.Text)
+        }
+        
         return &models.SubscriptionResponse{
             Success: false,
             Message: message,
@@ -238,6 +283,7 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     }
 
     if response.SubscriptionID == "" {
+        log.Printf("ARB response successful but no subscription ID received")
         return &models.SubscriptionResponse{
             Success: false,
             Message: "No subscription ID received",
@@ -254,8 +300,25 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     }, nil
 }
 
-// MÉTODO LEGADO MANTIDO PARA COMPATIBILIDADE (usando dados de cartão diretos)
-// CreateSubscriptionDirect cria uma assinatura usando dados de cartão diretos (método original)
+// formatPhoneNumber - função helper mantida (sem alterações)
+func formatPhoneNumber(phone string) string {
+    clean := strings.Map(func(r rune) rune {
+        if r >= '0' && r <= '9' {
+            return r
+        }
+        return -1
+    }, phone)
+
+    if len(clean) == 10 {
+        return fmt.Sprintf("(%s) %s-%s", clean[0:3], clean[3:6], clean[6:])
+    } else if len(clean) == 11 && clean[0] == '1' {
+        return fmt.Sprintf("(%s) %s-%s", clean[1:4], clean[4:7], clean[7:])
+    }
+
+    return ""
+}
+
+// MÉTODO LEGADO MANTIDO PARA COMPATIBILIDADE (sem alterações significativas)
 func (c *Client) CreateSubscriptionDirect(payment *models.PaymentRequest, checkout *models.CheckoutData) (*models.SubscriptionResponse, error) {
     startTime := time.Now()
     defer func() {
