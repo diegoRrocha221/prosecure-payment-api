@@ -176,7 +176,7 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         requestID = job.ID
     }
     
-    log.Printf("[RequestID: %s] Processing delayed PAYMENT ONLY for checkout: %s (account already created), retry: %d", requestID, checkoutID, job.RetryCount)
+    log.Printf("[RequestID: %s] Processing delayed PAYMENT with CUSTOMER PROFILE for checkout: %s (account already created), retry: %d", requestID, checkoutID, job.RetryCount)
     
     // Verificar se o checkout já foi processado para pagamento
     var paymentProcessed bool
@@ -306,20 +306,33 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     
     log.Printf("[RequestID: %s] Test transaction voided successfully", requestID)
     
-    // ETAPA 3: Criar ARB (assinatura recorrente)
-    log.Printf("[RequestID: %s] Step 3: Creating subscription (ARB)", requestID)
+    // NOVA ETAPA 3: Criar Customer Profile na Authorize.net
+    log.Printf("[RequestID: %s] Step 3: Creating Customer Profile in Authorize.net", requestID)
+    
+    customerProfileID, paymentProfileID, profileErr := w.paymentService.CreateCustomerProfile(paymentReq, checkout)
+    if profileErr != nil {
+        log.Printf("[RequestID: %s] Failed to create customer profile: %v", requestID, profileErr)
+        isLastAttempt := w.isLastAttempt(job)
+        return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to create customer profile: %v", profileErr), isLastAttempt)
+    }
+    
+    log.Printf("[RequestID: %s] Customer Profile created successfully - Profile ID: %s, Payment Profile ID: %s", 
+        requestID, customerProfileID, paymentProfileID)
+    
+    // ETAPA 4: Criar ARB (assinatura recorrente) usando o Customer Profile
+    log.Printf("[RequestID: %s] Step 4: Creating subscription (ARB) using Customer Profile", requestID)
     
     subscriptionErr := w.paymentService.SetupRecurringBilling(paymentReq, checkout)
     if subscriptionErr != nil {
-        log.Printf("[RequestID: %s] Failed to setup subscription: %v", requestID, subscriptionErr)
+        log.Printf("[RequestID: %s] Failed to setup subscription with customer profile: %v", requestID, subscriptionErr)
         isLastAttempt := w.isLastAttempt(job)
         return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", subscriptionErr), isLastAttempt)
     }
     
-    log.Printf("[RequestID: %s] Subscription created successfully", requestID)
+    log.Printf("[RequestID: %s] Subscription created successfully using Customer Profile", requestID)
     
-    // ETAPA 4: Atualizar transação no banco (já que a conta já existe)
-    log.Printf("[RequestID: %s] Step 4: Updating transaction record", requestID)
+    // ETAPA 5: Salvar Customer Profile IDs no banco de dados para uso futuro
+    log.Printf("[RequestID: %s] Step 5: Saving Customer Profile IDs to database", requestID)
     
     // Buscar o master_reference da conta que já foi criada
     var masterRef string
@@ -332,6 +345,24 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, masterErr)
         // Mesmo assim, considera sucesso pois o pagamento funcionou
     } else {
+        // Salvar os IDs do Customer Profile para uso futuro (para updates de cartão, etc.)
+        _, profileSaveErr := w.db.GetDB().ExecContext(ctx,
+            `INSERT INTO customer_profiles 
+             (master_reference, authorize_customer_profile_id, authorize_payment_profile_id, created_at)
+             VALUES (?, ?, ?, NOW())
+             ON DUPLICATE KEY UPDATE
+             authorize_customer_profile_id = ?,
+             authorize_payment_profile_id = ?,
+             updated_at = NOW()`,
+            masterRef, customerProfileID, paymentProfileID, customerProfileID, paymentProfileID)
+        
+        if profileSaveErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to save customer profile IDs: %v", requestID, profileSaveErr)
+            // Não falha o processo pois o pagamento já funcionou
+        } else {
+            log.Printf("[RequestID: %s] Customer Profile IDs saved successfully for future use", requestID)
+        }
+        
         // Atualizar a transação pendente com o ID real
         _, updateErr := w.db.GetDB().ExecContext(ctx,
             `UPDATE transactions 
@@ -347,13 +378,16 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     // Atualizar status do pagamento para sucesso
     _, statusErr := w.db.GetDB().ExecContext(ctx,
         `INSERT INTO payment_results 
-         (request_id, checkout_id, status, transaction_id, created_at)
-         VALUES (?, ?, 'success', ?, NOW())
+         (request_id, checkout_id, status, transaction_id, customer_profile_id, payment_profile_id, created_at)
+         VALUES (?, ?, 'success', ?, ?, ?, NOW())
          ON DUPLICATE KEY UPDATE
          status = 'success',
          transaction_id = ?,
+         customer_profile_id = ?,
+         payment_profile_id = ?,
          created_at = NOW()`,
-        requestID, checkoutID, transactionID, transactionID)
+        requestID, checkoutID, transactionID, customerProfileID, paymentProfileID,
+        transactionID, customerProfileID, paymentProfileID)
     
     if statusErr != nil {
         log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
@@ -368,8 +402,8 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
     }
     
-    // ETAPA 5: ENVIAR EMAIL DE INVOICE (apenas após sucesso completo)
-    log.Printf("[RequestID: %s] Step 5: Sending invoice email after successful payment processing", requestID)
+    // ETAPA 6: ENVIAR EMAIL DE INVOICE (apenas após sucesso completo)
+    log.Printf("[RequestID: %s] Step 6: Sending invoice email after successful payment processing", requestID)
     
     invoiceEmailContent := w.generateInvoiceEmail(checkout)
     emailErr := w.emailService.SendEmail(
@@ -385,7 +419,7 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         log.Printf("[RequestID: %s] Invoice email sent successfully to %s", requestID, checkout.Email)
     }
     
-    log.Printf("[RequestID: %s] Delayed payment processing completed successfully", requestID)
+    log.Printf("[RequestID: %s] Delayed payment processing with Customer Profile completed successfully", requestID)
     return nil
 }
 

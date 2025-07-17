@@ -90,8 +90,8 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
         return nil, fmt.Errorf("failed to void initial transaction: %v", err)
     }
 
-    // Configurar cobrança recorrente
-    log.Printf("Setting up recurring billing for checkout ID: %s", payment.CheckoutID)
+    // Configurar cobrança recorrente (AGORA COM CUSTOMER PROFILE)
+    log.Printf("Setting up recurring billing with customer profile for checkout ID: %s", payment.CheckoutID)
     if err := s.SetupRecurringBilling(payment, checkout); err != nil {
         log.Printf("Error setting up recurring billing: %v", err)
         // Tentar anular a transação novamente para garantir que não esteja pendente
@@ -163,7 +163,7 @@ func (s *Service) ValidateCard(payment *models.PaymentRequest) bool {
     return true
 }
 
-// SetupRecurringBilling configura cobrança recorrente
+// SetupRecurringBilling configura cobrança recorrente USANDO CUSTOMER PROFILE
 func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout *models.CheckoutData) error {
     if !s.ValidateCard(payment) {
         return errors.New("invalid card data for recurring billing setup")
@@ -171,21 +171,99 @@ func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout
 
     startTime := time.Now()
     defer func() {
-        log.Printf("Subscription setup took %v for checkout ID: %s", 
+        log.Printf("Subscription setup (with customer profile) took %v for checkout ID: %s", 
             time.Since(startTime), payment.CheckoutID)
     }()
 
-    // CreateSubscription retornará erro se a operação falhar
+    log.Printf("Setting up recurring billing with customer profile for checkout ID: %s", payment.CheckoutID)
+
+    // NOVO: Usar o método que cria customer profile + subscription
     subscriptionResp, err := s.client.CreateSubscription(payment, checkout)
     if err != nil {
-        return fmt.Errorf("failed to setup recurring billing: %v", err)
+        return fmt.Errorf("failed to setup recurring billing with customer profile: %v", err)
     }
 
     if !subscriptionResp.Success {
         return fmt.Errorf("subscription creation failed: %s", subscriptionResp.Message)
     }
 
-    log.Printf("Successfully created subscription with ID: %s", subscriptionResp.SubscriptionID)
+    log.Printf("Successfully created subscription with customer profile - Subscription ID: %s", subscriptionResp.SubscriptionID)
+    return nil
+}
+
+// SetupRecurringBillingDirect configura cobrança recorrente SEM CUSTOMER PROFILE (método legado)
+func (s *Service) SetupRecurringBillingDirect(payment *models.PaymentRequest, checkout *models.CheckoutData) error {
+    if !s.ValidateCard(payment) {
+        return errors.New("invalid card data for recurring billing setup")
+    }
+
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Subscription setup (direct method) took %v for checkout ID: %s", 
+            time.Since(startTime), payment.CheckoutID)
+    }()
+
+    log.Printf("Setting up recurring billing with direct card data for checkout ID: %s", payment.CheckoutID)
+
+    // Usar o método legado que usa dados de cartão diretos
+    subscriptionResp, err := s.client.CreateSubscriptionDirect(payment, checkout)
+    if err != nil {
+        return fmt.Errorf("failed to setup recurring billing (direct method): %v", err)
+    }
+
+    if !subscriptionResp.Success {
+        return fmt.Errorf("subscription creation failed (direct method): %s", subscriptionResp.Message)
+    }
+
+    log.Printf("Successfully created subscription (direct method) with ID: %s", subscriptionResp.SubscriptionID)
+    return nil
+}
+
+// CreateCustomerProfile cria um customer profile na Authorize.net
+func (s *Service) CreateCustomerProfile(payment *models.PaymentRequest, checkout *models.CheckoutData) (string, string, error) {
+    if !s.ValidateCard(payment) {
+        return "", "", errors.New("invalid card data for customer profile creation")
+    }
+
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Customer profile creation took %v for checkout ID: %s", 
+            time.Since(startTime), payment.CheckoutID)
+    }()
+
+    log.Printf("Creating customer profile for checkout ID: %s", payment.CheckoutID)
+
+    customerProfileID, paymentProfileID, err := s.client.CreateCustomerProfile(payment, checkout)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to create customer profile: %v", err)
+    }
+
+    log.Printf("Successfully created customer profile - Profile ID: %s, Payment Profile ID: %s", 
+        customerProfileID, paymentProfileID)
+    
+    return customerProfileID, paymentProfileID, nil
+}
+
+// UpdateCustomerPaymentProfile atualiza método de pagamento em um customer profile existente
+func (s *Service) UpdateCustomerPaymentProfile(customerProfileID, paymentProfileID string, payment *models.PaymentRequest, checkout *models.CheckoutData) error {
+    if !s.ValidateCard(payment) {
+        return errors.New("invalid card data for payment profile update")
+    }
+
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Customer payment profile update took %v for profile: %s/%s", 
+            time.Since(startTime), customerProfileID, paymentProfileID)
+    }()
+
+    log.Printf("Updating customer payment profile: %s/%s", customerProfileID, paymentProfileID)
+
+    err := s.client.UpdateCustomerPaymentProfile(customerProfileID, paymentProfileID, payment, checkout)
+    if err != nil {
+        return fmt.Errorf("failed to update customer payment profile: %v", err)
+    }
+
+    log.Printf("Successfully updated customer payment profile: %s/%s", customerProfileID, paymentProfileID)
     return nil
 }
 

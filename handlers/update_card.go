@@ -369,7 +369,94 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateFast(ctx context.Context
         }
     }()
     
-    // 1. Atualizar método de pagamento
+    // 1. Verificar se existe Customer Profile para este usuário
+    var customerProfileID, paymentProfileID string
+    profileErr := h.db.GetDB().QueryRowContext(ctx,
+        `SELECT authorize_customer_profile_id, authorize_payment_profile_id 
+         FROM customer_profiles 
+         WHERE master_reference = ?`,
+        master.ReferenceUUID).Scan(&customerProfileID, &paymentProfileID)
+    
+    // 2. Se existe Customer Profile, atualizar na Authorize.net
+    if profileErr == nil && customerProfileID != "" && paymentProfileID != "" {
+        log.Printf("Updating existing Customer Profile: %s/%s for user: %s", 
+            customerProfileID, paymentProfileID, master.Username)
+        
+        // Converter MasterAccount para CheckoutData para compatibilidade
+        checkoutData := h.convertMasterAccountToCheckoutData(master)
+        
+        // Atualizar o Customer Profile na Authorize.net
+        updateErr := h.paymentService.UpdateCustomerPaymentProfile(
+            customerProfileID, 
+            paymentProfileID, 
+            payment, 
+            checkoutData,
+        )
+        
+        if updateErr != nil {
+            log.Printf("Failed to update Customer Profile, will create new one: %v", updateErr)
+            
+            // Se falhar a atualização, criar um novo Customer Profile
+            newCustomerProfileID, newPaymentProfileID, createErr := h.paymentService.CreateCustomerProfile(payment, checkoutData)
+            if createErr != nil {
+                return fmt.Errorf("failed to create new customer profile after update failure: %v", createErr)
+            }
+            
+            // Atualizar os IDs no banco de dados
+            _, err = h.db.GetDB().ExecContext(ctx,
+                `UPDATE customer_profiles 
+                 SET authorize_customer_profile_id = ?, 
+                     authorize_payment_profile_id = ?,
+                     updated_at = NOW()
+                 WHERE master_reference = ?`,
+                newCustomerProfileID, newPaymentProfileID, master.ReferenceUUID)
+            
+            if err != nil {
+                return fmt.Errorf("failed to update customer profile IDs: %v", err)
+            }
+            
+            log.Printf("Created new Customer Profile: %s/%s for user: %s", 
+                newCustomerProfileID, newPaymentProfileID, master.Username)
+            
+        } else {
+            log.Printf("Successfully updated Customer Profile: %s/%s for user: %s", 
+                customerProfileID, paymentProfileID, master.Username)
+        }
+        
+    } else {
+        // 3. Se não existe Customer Profile, criar um novo
+        log.Printf("No existing Customer Profile found for user: %s, creating new one", master.Username)
+        
+        checkoutData := h.convertMasterAccountToCheckoutData(master)
+        
+        newCustomerProfileID, newPaymentProfileID, createErr := h.paymentService.CreateCustomerProfile(payment, checkoutData)
+        if createErr != nil {
+            return fmt.Errorf("failed to create customer profile: %v", createErr)
+        }
+        
+        // Inserir os novos IDs no banco de dados
+        _, err = h.db.GetDB().ExecContext(ctx,
+            `INSERT INTO customer_profiles 
+             (master_reference, authorize_customer_profile_id, authorize_payment_profile_id, created_at)
+             VALUES (?, ?, ?, NOW())
+             ON DUPLICATE KEY UPDATE
+             authorize_customer_profile_id = ?,
+             authorize_payment_profile_id = ?,
+             updated_at = NOW()`,
+            master.ReferenceUUID, newCustomerProfileID, newPaymentProfileID,
+            newCustomerProfileID, newPaymentProfileID)
+        
+        if err != nil {
+            return fmt.Errorf("failed to save customer profile IDs: %v", err)
+        }
+        
+        log.Printf("Created and saved new Customer Profile: %s/%s for user: %s", 
+            newCustomerProfileID, newPaymentProfileID, master.Username)
+    }
+    
+    // 4. Continuar com as operações existentes...
+    
+    // Atualizar método de pagamento (billing_infos)
     cardData := &models.CardData{
         Number: payment.CardNumber,
         Expiry: payment.Expiry,
@@ -379,7 +466,7 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateFast(ctx context.Context
         return fmt.Errorf("failed to update payment method: %v", err)
     }
     
-    // 2. Atualizar status do usuário para ativo (is_active = 1)
+    // Atualizar status do usuário para ativo (is_active = 1)
     _, err = h.db.GetDB().ExecContext(ctx,
         "UPDATE users SET is_active = 1 WHERE email = ? AND username = ?",
         master.Email, master.Username)
@@ -388,7 +475,7 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateFast(ctx context.Context
         return fmt.Errorf("failed to reactivate user: %v", err)
     }
     
-    // 3. Atualizar status das subscriptions para ativa
+    // Atualizar status das subscriptions para ativa
     _, err = h.db.GetDB().ExecContext(ctx,
         "UPDATE subscriptions SET status = 'active', updated_at = NOW() WHERE master_reference = ?",
         master.ReferenceUUID)
@@ -397,7 +484,7 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateFast(ctx context.Context
         return fmt.Errorf("failed to update subscription status: %v", err)
     }
     
-    // 4. Registrar nova transação
+    // Registrar nova transação
     if err = tx.SaveTransaction(master.ReferenceUUID, "CARD_UPDATE", 1.00, "voided", transactionID); err != nil {
         return fmt.Errorf("failed to save transaction: %v", err)
     }
@@ -407,7 +494,7 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateFast(ctx context.Context
         return fmt.Errorf("failed to commit transaction: %v", err)
     }
     
-    log.Printf("Successfully updated account data for user: %s", master.Username)
+    log.Printf("Successfully updated account data with Customer Profile for user: %s", master.Username)
     return nil
 }
 

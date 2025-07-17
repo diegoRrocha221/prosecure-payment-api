@@ -82,7 +82,7 @@ type createTransactionResponse struct {
     Messages          MessagesType        `json:"messages"`
 }
 
-// ARB Types
+// ARB Types (Original - usando dados de cartão diretos)
 type ARBSubscriptionRequest struct {
     MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
     RefID                 string                    `json:"refId"`
@@ -136,4 +136,211 @@ type ARBResponse struct {
     RefID         string       `json:"refId"`
     SubscriptionID string       `json:"subscriptionId,omitempty"`
     Messages      MessagesType `json:"messages"`
+}
+
+// ==============================================
+// CIM (Customer Information Manager) TYPES
+// ==============================================
+
+// CreateCustomerProfileRequest representa a requisição para criar um customer profile
+type CreateCustomerProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
+    RefID                 string                    `json:"refId,omitempty"`
+    Profile               CustomerProfileType       `json:"profile"`
+    ValidationMode        string                    `json:"validationMode,omitempty"`
+}
+
+// CreateCustomerProfileWrapper é o wrapper para a requisição
+type CreateCustomerProfileRequestWrapper struct {
+    CreateCustomerProfileRequest CreateCustomerProfileRequest `json:"createCustomerProfileRequest"`
+}
+
+// CustomerProfileType representa um perfil de cliente
+type CustomerProfileType struct {
+    MerchantCustomerID string                     `json:"merchantCustomerId,omitempty"`
+    Description       string                     `json:"description,omitempty"`
+    Email             string                     `json:"email,omitempty"`
+    PaymentProfiles   []CustomerPaymentProfileType `json:"paymentProfiles,omitempty"`
+    ShipToList        []CustomerAddressType      `json:"shipToList,omitempty"`
+}
+
+// CustomerPaymentProfileType representa um perfil de pagamento
+type CustomerPaymentProfileType struct {
+    CustomerType            string                `json:"customerType,omitempty"`
+    BillTo                  *CustomerAddressType  `json:"billTo,omitempty"`
+    Payment                 *PaymentType          `json:"payment,omitempty"`
+    DefaultPaymentProfile   bool                  `json:"defaultPaymentProfile,omitempty"`
+}
+
+// CreateCustomerProfileResponse representa a resposta da criação do profile
+type CreateCustomerProfileResponse struct {
+    Messages                      MessagesType `json:"messages"`
+    CustomerProfileID            string       `json:"customerProfileId,omitempty"`
+    CustomerPaymentProfileIDList []string     `json:"customerPaymentProfileIdList,omitempty"`
+    CustomerShippingAddressIDList []string    `json:"customerShippingAddressIdList,omitempty"`
+    ValidationDirectResponseList []string     `json:"validationDirectResponseList,omitempty"`
+}
+
+// ARBSubscriptionTypeWithProfile é a versão do ARB que usa Customer Profile
+type ARBSubscriptionTypeWithProfile struct {
+    Name            string             `json:"name"`
+    PaymentSchedule PaymentScheduleType `json:"paymentSchedule"`
+    Amount         string             `json:"amount"`
+    Profile        ProfileType        `json:"profile"`
+    Order          OrderType          `json:"order"`
+    Customer       CustomerType       `json:"customer"`
+    BillTo         CustomerAddressType `json:"billTo"`
+}
+
+// ProfileType representa a referência ao customer profile para ARB
+type ProfileType struct {
+    CustomerProfileID       string `json:"customerProfileId"`
+    CustomerPaymentProfileID string `json:"customerPaymentProfileId"`
+    CustomerAddressID       string `json:"customerAddressId,omitempty"`
+}
+
+// ARBSubscriptionRequestWithProfile é a requisição ARB usando Customer Profile
+type ARBSubscriptionRequestWithProfile struct {
+    MerchantAuthentication merchantAuthenticationType     `json:"merchantAuthentication"`
+    RefID                 string                        `json:"refId"`
+    Subscription         ARBSubscriptionTypeWithProfile `json:"subscription"`
+}
+
+// GetCustomerProfileRequest para buscar um perfil existente
+type GetCustomerProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
+    CustomerProfileID     string                    `json:"customerProfileId"`
+    UnmaskExpirationDate  bool                      `json:"unmaskExpirationDate,omitempty"`
+    IncludeIssuerInfo     bool                      `json:"includeIssuerInfo,omitempty"`
+}
+
+// GetCustomerProfileRequestWrapper
+type GetCustomerProfileRequestWrapper struct {
+    GetCustomerProfileRequest GetCustomerProfileRequest `json:"getCustomerProfileRequest"`
+}
+
+// GetCustomerProfileResponse 
+type GetCustomerProfileResponse struct {
+    Messages MessagesType        `json:"messages"`
+    Profile  CustomerProfileType `json:"profile,omitempty"`
+}
+
+// UpdateCustomerPaymentProfileRequest para atualizar método de pagamento
+type UpdateCustomerPaymentProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType  `json:"merchantAuthentication"`
+    CustomerProfileID     string                     `json:"customerProfileId"`
+    PaymentProfile        CustomerPaymentProfileType `json:"paymentProfile"`
+    ValidationMode        string                     `json:"validationMode,omitempty"`
+}
+
+// UpdateCustomerPaymentProfileRequestWrapper
+type UpdateCustomerPaymentProfileRequestWrapper struct {
+    UpdateCustomerPaymentProfileRequest UpdateCustomerPaymentProfileRequest `json:"updateCustomerPaymentProfileRequest"`
+}
+
+// UpdateCustomerPaymentProfileResponse
+type UpdateCustomerPaymentProfileResponse struct {
+    Messages                     MessagesType `json:"messages"`
+    ValidationDirectResponse    string       `json:"validationDirectResponse,omitempty"`
+}
+
+type CreateCustomerProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
+    RefID                 string                    `json:"refId,omitempty"`
+    Profile               CustomerProfileType       `json:"profile"`
+    ValidationMode        string                    `json:"validationMode,omitempty"`
+}
+
+// CreateCustomerProfileWrapper é o wrapper para a requisição
+type CreateCustomerProfileRequestWrapper struct {
+    CreateCustomerProfileRequest CreateCustomerProfileRequest `json:"createCustomerProfileRequest"`
+}
+
+// CustomerProfileType representa um perfil de cliente
+type CustomerProfileType struct {
+    MerchantCustomerID string                     `json:"merchantCustomerId,omitempty"`
+    Description       string                     `json:"description,omitempty"`
+    Email             string                     `json:"email,omitempty"`
+    PaymentProfiles   []CustomerPaymentProfileType `json:"paymentProfiles,omitempty"`
+    ShipToList        []CustomerAddressType      `json:"shipToList,omitempty"`
+}
+
+// CustomerPaymentProfileType representa um perfil de pagamento
+type CustomerPaymentProfileType struct {
+    CustomerType            string                `json:"customerType,omitempty"`
+    BillTo                  *CustomerAddressType  `json:"billTo,omitempty"`
+    Payment                 *PaymentType          `json:"payment,omitempty"`
+    DefaultPaymentProfile   bool                  `json:"defaultPaymentProfile,omitempty"`
+}
+
+// CreateCustomerProfileResponse representa a resposta da criação do profile
+type CreateCustomerProfileResponse struct {
+    Messages                      MessagesType `json:"messages"`
+    CustomerProfileID            string       `json:"customerProfileId,omitempty"`
+    CustomerPaymentProfileIDList []string     `json:"customerPaymentProfileIdList,omitempty"`
+    CustomerShippingAddressIDList []string    `json:"customerShippingAddressIdList,omitempty"`
+    ValidationDirectResponseList []string     `json:"validationDirectResponseList,omitempty"`
+}
+
+// ARBSubscriptionTypeWithProfile é a versão do ARB que usa Customer Profile
+type ARBSubscriptionTypeWithProfile struct {
+    Name            string             `json:"name"`
+    PaymentSchedule PaymentScheduleType `json:"paymentSchedule"`
+    Amount         string             `json:"amount"`
+    Profile        ProfileType        `json:"profile"`
+    Order          OrderType          `json:"order"`
+    Customer       CustomerType       `json:"customer"`
+    BillTo         CustomerAddressType `json:"billTo"`
+}
+
+// ProfileType representa a referência ao customer profile para ARB
+type ProfileType struct {
+    CustomerProfileID       string `json:"customerProfileId"`
+    CustomerPaymentProfileID string `json:"customerPaymentProfileId"`
+    CustomerAddressID       string `json:"customerAddressId,omitempty"`
+}
+
+// ARBSubscriptionRequestWithProfile é a requisição ARB usando Customer Profile
+type ARBSubscriptionRequestWithProfile struct {
+    MerchantAuthentication merchantAuthenticationType     `json:"merchantAuthentication"`
+    RefID                 string                        `json:"refId"`
+    Subscription         ARBSubscriptionTypeWithProfile `json:"subscription"`
+}
+
+// GetCustomerProfileRequest para buscar um perfil existente
+type GetCustomerProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
+    CustomerProfileID     string                    `json:"customerProfileId"`
+    UnmaskExpirationDate  bool                      `json:"unmaskExpirationDate,omitempty"`
+    IncludeIssuerInfo     bool                      `json:"includeIssuerInfo,omitempty"`
+}
+
+// GetCustomerProfileRequestWrapper
+type GetCustomerProfileRequestWrapper struct {
+    GetCustomerProfileRequest GetCustomerProfileRequest `json:"getCustomerProfileRequest"`
+}
+
+// GetCustomerProfileResponse 
+type GetCustomerProfileResponse struct {
+    Messages MessagesType        `json:"messages"`
+    Profile  CustomerProfileType `json:"profile,omitempty"`
+}
+
+// UpdateCustomerPaymentProfileRequest para atualizar método de pagamento
+type UpdateCustomerPaymentProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType  `json:"merchantAuthentication"`
+    CustomerProfileID     string                     `json:"customerProfileId"`
+    PaymentProfile        CustomerPaymentProfileType `json:"paymentProfile"`
+    ValidationMode        string                     `json:"validationMode,omitempty"`
+}
+
+// UpdateCustomerPaymentProfileRequestWrapper
+type UpdateCustomerPaymentProfileRequestWrapper struct {
+    UpdateCustomerPaymentProfileRequest UpdateCustomerPaymentProfileRequest `json:"updateCustomerPaymentProfileRequest"`
+}
+
+// UpdateCustomerPaymentProfileResponse
+type UpdateCustomerPaymentProfileResponse struct {
+    Messages                     MessagesType `json:"messages"`
+    ValidationDirectResponse    string       `json:"validationDirectResponse,omitempty"`
 }
