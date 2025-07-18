@@ -139,10 +139,6 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
                 CustomerPaymentProfileID: paymentProfileID,
                 // CustomerAddressID é opcional e não usado neste caso
             },
-            Order: OrderType{
-                InvoiceNumber: fmt.Sprintf("INV-%s", time.Now().Format("20060102150405")),
-                Description:   "ProSecure Security Services Subscription",
-            },
             Customer: CustomerType{
                 Type:        "individual",
                 Email:       checkout.Email,
