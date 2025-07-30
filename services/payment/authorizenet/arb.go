@@ -49,7 +49,6 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     log.Printf("Creating ARB subscription with Customer Profile ID: %s, Payment Profile ID: %s", 
         customerProfileID, paymentProfileID)
     
-    // Validar que temos IDs válidos
     if customerProfileID == "" || paymentProfileID == "" {
         return &models.SubscriptionResponse{
             Success: false,
@@ -63,113 +62,58 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
         Unit:   "months",
     }
 
-    // Calcular o total e definir o intervalo de cobrança
     for _, plan := range checkout.Plans {
         if plan.Annually == 1 {
             interval = IntervalType{
                 Length: 12,
                 Unit:   "months",
             }
-            total += plan.Price * 10 // 10 meses para anual (desconto de 2 meses)
+            total += plan.Price * 10
         } else {
             total += plan.Price
         }
     }
 
-    log.Printf("Creating subscription with customer profile, total amount: %.2f, interval: %d %s", 
-        total, interval.Length, interval.Unit)
-
-    // Definir data de início para um mês após a data atual
-    startDate := time.Now().AddDate(0, 1, 0).Format("2006-01-02") 
-    log.Printf("Subscription start date: %s", startDate)
+    startDate := time.Now().AddDate(0, 1, 0).Format("2006-01-02")
+    refId := c.normalizeRefID(payment.CheckoutID)
     
-    // CORREÇÃO: Truncar RefID para máximo de 20 caracteres
-    refId := payment.CheckoutID
-    if len(refId) > 20 {
-        refId = refId[:20]
-        log.Printf("RefID truncated from %s to %s for ARB request", payment.CheckoutID, refId)
-    }
-    
-    // CORREÇÃO: Truncar nome da subscription para máximo de 50 caracteres
-    maxNameLength := 50
-    subscriptionName := fmt.Sprintf("ProSecure Subscription - %s", checkout.Username)
-    if len(subscriptionName) > maxNameLength {
-        prefix := "ProSecure - "
-        availableSpace := maxNameLength - len(prefix)
-        if availableSpace > 0 && len(checkout.Username) > availableSpace {
-            truncatedUsername := checkout.Username[:availableSpace]
-            subscriptionName = prefix + truncatedUsername
-        } else if availableSpace > 0 {
-            subscriptionName = prefix + checkout.Username
-        } else {
-            subscriptionName = "ProSecure Subscription"
-        }
-        log.Printf("Subscription name truncated from '%s' to '%s' (max %d chars)", 
-            fmt.Sprintf("ProSecure Subscription - %s", checkout.Username), subscriptionName, maxNameLength)
-    }
-    
-    // CORREÇÃO CRÍTICA: Estrutura simplificada para ARB com Customer Profile
-    // NÃO incluir campos customer ou billTo quando usando profile
-    request := map[string]interface{}{
-        "ARBCreateSubscriptionRequest": map[string]interface{}{
-            "merchantAuthentication": map[string]interface{}{
-                "name":           c.apiLoginID,
-                "transactionKey": c.transactionKey,
+    // ESTRUTURA CORRETA PARA ARB COM CUSTOMER PROFILE
+    request := ARBSubscriptionRequestWithProfile{
+        MerchantAuthentication: c.getMerchantAuthentication(),
+        RefID: refId,
+        Subscription: ARBSubscriptionTypeWithProfile{
+            PaymentSchedule: PaymentScheduleType{
+                Interval:         interval,
+                StartDate:       startDate,
+                TotalOccurrences: "9999",
             },
-            "refId": refId,
-            "subscription": map[string]interface{}{
-                "paymentSchedule": map[string]interface{}{
-                    "interval": map[string]interface{}{
-                        "length": interval.Length,
-                        "unit":   interval.Unit,
-                    },
-                    "startDate":        startDate,
-                    "totalOccurrences": "9999",
-                },
-                "amount": fmt.Sprintf("%.2f", total),
-                "profile": map[string]interface{}{
-                    "customerProfileId":        customerProfileID,
-                    "customerPaymentProfileId": paymentProfileID,
-                },
-                // REMOVIDO: customer e billTo - esses campos NÃO devem ser incluídos com profile
+            Amount: fmt.Sprintf("%.2f", total),
+            Profile: ProfileType{
+                CustomerProfileID:       customerProfileID,
+                CustomerPaymentProfileID: paymentProfileID,
             },
+            // NÃO incluir Name, Customer, BillTo quando usar Profile
         },
     }
 
-    // CORREÇÃO: Log da estrutura da requisição (sem dados sensíveis)
-    log.Printf("ARB Request Structure - RefID: %s, Amount: %.2f, CustomerProfileID: %s, PaymentProfileID: %s, Name: %s",
-        refId, total, customerProfileID, paymentProfileID, subscriptionName)
-
-    // Serializar para JSON
-    jsonPayload, err := json.Marshal(request)
+    jsonPayload, err := json.Marshal(map[string]interface{}{
+        "ARBCreateSubscriptionRequest": request,
+    })
     if err != nil {
-        log.Printf("Error marshaling ARB subscription request: %v", err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error marshaling subscription request: %v", err),
         }, nil
     }
 
-    // CORREÇÃO: Log do tamanho do payload (para debug)
-    log.Printf("ARB JSON payload size: %d bytes", len(jsonPayload))
-    
-    // Log da primeira parte do JSON (sem dados sensíveis) para debug
-    jsonPreview := string(jsonPayload)
-    if len(jsonPreview) > 300 {
-        jsonPreview = jsonPreview[:300] + "..."
-    }
-    log.Printf("ARB JSON preview: %s", jsonPreview)
+    log.Printf("ARB Request with Customer Profile - RefID: %s, Amount: %.2f, ProfileID: %s", 
+        refId, total, customerProfileID)
 
-    log.Printf("Sending ARB request with customer profile to Authorize.net for checkout: %s (Profile: %s)", 
-        payment.CheckoutID, customerProfileID)
-
-    // Criar contexto com timeout
-    ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout) 
+    ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
     defer cancel()
     
     httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
     if err != nil {
-        log.Printf("Error creating ARB HTTP request: %v", err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error creating ARB request: %v", err),
@@ -179,11 +123,6 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     httpReq.Header.Set("Content-Type", "application/json")
     httpReq.Header.Set("Cache-Control", "no-cache")
 
-    // Log dos headers da requisição
-    log.Printf("ARB Request Headers: Content-Type=%s, Endpoint=%s", 
-        httpReq.Header.Get("Content-Type"), c.getEndpoint())
-
-    // Usar mutex para garantir thread safety
     c.mutex.Lock()
     requestStart := time.Now()
     resp, err := c.client.Do(httpReq)
@@ -199,28 +138,14 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     }
     defer resp.Body.Close()
 
-    log.Printf("ARB HTTP request completed in %v, status code: %d", requestDuration, resp.StatusCode)
-
     respBody, err := io.ReadAll(resp.Body)
     if err != nil {
-        log.Printf("Error reading ARB response body: %v", err)
         return &models.SubscriptionResponse{
             Success: false,
             Message: fmt.Sprintf("Error reading ARB response body: %v", err),
         }, nil
     }
 
-    log.Printf("ARB response received for checkout: %s, response size: %d bytes", 
-        payment.CheckoutID, len(respBody))
-
-    // Log da primeira parte da resposta para debug
-    responsePreview := string(respBody)
-    if len(responsePreview) > 500 {
-        responsePreview = responsePreview[:500] + "..."
-    }
-    log.Printf("ARB response preview: %s", responsePreview)
-
-    // Remover BOM se presente
     cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")
 
     var response ARBResponse
@@ -233,23 +158,11 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
         }, nil
     }
 
-    // Log da estrutura da resposta
-    log.Printf("ARB Response - ResultCode: %s, SubscriptionID: %s, RefID: %s", 
-        response.Messages.ResultCode, response.SubscriptionID, response.RefID)
-
     if response.Messages.ResultCode == "Error" {
         message := "Subscription creation failed"
         if len(response.Messages.Message) > 0 {
             message = response.Messages.Message[0].Text
-            log.Printf("ARB Error Details - Code: %s, Text: %s", 
-                response.Messages.Message[0].Code, response.Messages.Message[0].Text)
         }
-        
-        // CORREÇÃO: Log de todos os erros se houver múltiplos
-        for i, msg := range response.Messages.Message {
-            log.Printf("ARB Error %d - Code: %s, Text: %s", i+1, msg.Code, msg.Text)
-        }
-        
         return &models.SubscriptionResponse{
             Success: false,
             Message: message,
@@ -257,7 +170,6 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     }
 
     if response.SubscriptionID == "" {
-        log.Printf("ARB response successful but no subscription ID received")
         return &models.SubscriptionResponse{
             Success: false,
             Message: "No subscription ID received",

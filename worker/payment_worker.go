@@ -398,68 +398,82 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     
     // ETAPA 5: Salvar Customer Profile IDs no banco de dados para uso futuro
     log.Printf("[RequestID: %s] Step 5: Saving Customer Profile IDs to database", requestID)
+
+// CORREÇÃO: Usar contexto com timeout maior para operações de banco
+dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer dbCancel()
+
+// Buscar o master_reference da conta que já foi criada
+var masterRef string
+masterErr := w.db.GetDB().QueryRowContext(dbCtx, 
+    `SELECT reference_uuid FROM master_accounts 
+     WHERE username = ? AND email = ? LIMIT 1`,
+    checkout.Username, checkout.Email).Scan(&masterRef)
+
+if masterErr != nil {
+    log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, masterErr)
     
-    // Buscar o master_reference da conta que já foi criada
-    var masterRef string
-    masterErr := w.db.GetDB().QueryRowContext(ctx, 
-        `SELECT reference_uuid FROM master_accounts 
-         WHERE username = ? AND email = ? LIMIT 1`,
-        checkout.Username, checkout.Email).Scan(&masterRef)
+    // CORREÇÃO: Tentar buscar pela transação em vez da master account
+    transactionErr := w.db.GetDB().QueryRowContext(dbCtx,
+        `SELECT master_reference FROM transactions 
+         WHERE checkout_id = ? AND status = 'authorized' 
+         ORDER BY created_at DESC LIMIT 1`,
+        checkoutID).Scan(&masterRef)
     
-    if masterErr != nil {
-        log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, masterErr)
+    if transactionErr != nil {
+        log.Printf("[RequestID: %s] Warning: Could not find master reference via transaction: %v", requestID, transactionErr)
         // Mesmo assim, considera sucesso pois o pagamento funcionou
     } else {
-        // Salvar os IDs do Customer Profile para uso futuro (para updates de cartão, etc.)
-        _, profileSaveErr := w.db.GetDB().ExecContext(ctx,
-            `INSERT INTO customer_profiles 
-             (master_reference, authorize_customer_profile_id, authorize_payment_profile_id, created_at)
-             VALUES (?, ?, ?, NOW())
-             ON DUPLICATE KEY UPDATE
-             authorize_customer_profile_id = ?,
-             authorize_payment_profile_id = ?,
-             updated_at = NOW()`,
-            masterRef, customerProfileID, paymentProfileID, customerProfileID, paymentProfileID)
-        
-        if profileSaveErr != nil {
-            log.Printf("[RequestID: %s] Warning: Failed to save customer profile IDs: %v", requestID, profileSaveErr)
-            // Não falha o processo pois o pagamento já funcionou
-        } else {
-            log.Printf("[RequestID: %s] Customer Profile IDs saved successfully for future use", requestID)
-        }
-        
-        // Atualizar a transação pendente com o ID real
-        _, updateErr := w.db.GetDB().ExecContext(ctx,
-            `UPDATE transactions 
-             SET transaction_id = ?, status = 'authorized', updated_at = NOW()
-             WHERE master_reference = ? AND transaction_id = 'PENDING'`,
-            transactionID, masterRef)
-        
-        if updateErr != nil {
-            log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, updateErr)
-        }
+        log.Printf("[RequestID: %s] Found master reference via transaction: %s", requestID, masterRef)
+    }
+} else {
+    log.Printf("[RequestID: %s] Found master reference via master_accounts: %s", requestID, masterRef)
+}
+
+// Se encontrou o master reference, salvar Customer Profile IDs
+if masterRef != "" {
+    profileSaveErr := w.db.SaveCustomerProfile(masterRef, customerProfileID, paymentProfileID)
+    if profileSaveErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to save customer profile IDs: %v", requestID, profileSaveErr)
+        // Não falha o processo pois o pagamento já funcionou
+    } else {
+        log.Printf("[RequestID: %s] Customer Profile IDs saved successfully for future use", requestID)
     }
     
-    // Atualizar status do pagamento para sucesso
-    _, statusErr := w.db.GetDB().ExecContext(ctx,
-        `INSERT INTO payment_results 
-         (request_id, checkout_id, status, transaction_id, customer_profile_id, payment_profile_id, created_at)
-         VALUES (?, ?, 'success', ?, ?, ?, NOW())
-         ON DUPLICATE KEY UPDATE
-         status = 'success',
-         transaction_id = ?,
-         customer_profile_id = ?,
-         payment_profile_id = ?,
-         created_at = NOW()`,
-        requestID, checkoutID, transactionID, customerProfileID, paymentProfileID,
-        transactionID, customerProfileID, paymentProfileID)
+    // Atualizar a transação pendente com o ID real
+    _, updateErr := w.db.GetDB().ExecContext(dbCtx,
+        `UPDATE transactions 
+         SET transaction_id = ?, status = 'authorized', updated_at = NOW()
+         WHERE master_reference = ? AND transaction_id = 'PENDING'`,
+        transactionID, masterRef)
     
-    if statusErr != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
+    if updateErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, updateErr)
     }
-    
-    // CORREÇÃO: Não limpar dados de cartão temporários imediatamente para permitir futuras tentativas
-    // Apenas agendar limpeza para depois de algumas horas
+} else {
+    log.Printf("[RequestID: %s] Could not find master reference - Customer Profile IDs not saved", requestID)
+}
+
+// Atualizar status do pagamento para sucesso
+paymentStatusCtx, paymentCancel := context.WithTimeout(context.Background(), 15*time.Second)
+defer paymentCancel()
+
+_, statusErr := w.db.GetDB().ExecContext(paymentStatusCtx,
+    `INSERT INTO payment_results 
+     (request_id, checkout_id, status, transaction_id, customer_profile_id, payment_profile_id, created_at)
+     VALUES (?, ?, 'success', ?, ?, ?, NOW())
+     ON DUPLICATE KEY UPDATE
+     status = 'success',
+     transaction_id = ?,
+     customer_profile_id = ?,
+     payment_profile_id = ?,
+     created_at = NOW()`,
+    requestID, checkoutID, transactionID, customerProfileID, paymentProfileID,
+    transactionID, customerProfileID, paymentProfileID)
+
+if statusErr != nil {
+    log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
+}
     go func() {
         time.Sleep(6 * time.Hour) // Aguardar 6 horas antes de limpar
         cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
