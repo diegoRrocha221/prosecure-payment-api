@@ -29,15 +29,17 @@ type PaymentType struct {
 }
 
 type transactionRequestType struct {
-    TransactionType    string                   `json:"transactionType"`
-    Amount            string                   `json:"amount,omitempty"`
-    Payment           *PaymentType             `json:"payment,omitempty"`
-    RefTransId        string                   `json:"refTransId,omitempty"`
-    Order             *OrderType               `json:"order,omitempty"`
-    Customer          *CustomerType            `json:"customer,omitempty"`
-    BillTo            *types.BillingInfoType    `json:"billTo,omitempty"`
+    TransactionType     string                    `json:"transactionType"`
+    Amount             string                    `json:"amount,omitempty"`
+    Payment            *PaymentType              `json:"payment,omitempty"`
+    Profile            *ProfileTransactionType   `json:"profile,omitempty"`  // ADICIONAR ESTA LINHA
+    RefTransId         string                    `json:"refTransId,omitempty"`
+    Order              *OrderType                `json:"order,omitempty"`
+    Customer           *CustomerType             `json:"customer,omitempty"`
+    BillTo             *types.BillingInfoType    `json:"billTo,omitempty"`
     TransactionSettings *TransactionSettingsType `json:"transactionSettings,omitempty"`
 }
+
 
 type TransactionSettingsType struct {
     Settings []SettingType `json:"setting,omitempty"`
@@ -224,4 +226,26 @@ type UpdateCustomerPaymentProfileRequestWrapper struct {
 type UpdateCustomerPaymentProfileResponse struct {
     Messages                     MessagesType `json:"messages"`
     ValidationDirectResponse    string       `json:"validationDirectResponse,omitempty"`
+}
+
+type ProfileTransactionType struct {
+    CustomerProfileID string              `json:"customerProfileId"`
+    PaymentProfile    *PaymentProfileType `json:"paymentProfile,omitempty"`
+}
+
+type PaymentProfileType struct {
+    PaymentProfileID string `json:"paymentProfileId"`
+    CardCode         string `json:"cardCode,omitempty"`
+}
+
+// Types for updating ARB subscription
+type ARBUpdateSubscriptionRequest struct {
+    MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
+    RefID                 string                    `json:"refId,omitempty"`
+    SubscriptionID        string                    `json:"subscriptionId"`
+    Subscription         ARBUpdateSubscriptionType `json:"subscription"`
+}
+
+type ARBUpdateSubscriptionType struct {
+    Amount string `json:"amount,omitempty"`
 }

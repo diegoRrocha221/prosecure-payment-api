@@ -266,7 +266,40 @@ func (s *Service) UpdateCustomerPaymentProfile(customerProfileID, paymentProfile
     log.Printf("Successfully updated customer payment profile: %s/%s", customerProfileID, paymentProfileID)
     return nil
 }
+func (s *Service) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, billingInfo *models.BillingInfo) (string, error) {
+    log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
+    
+    if amount <= 0 {
+        return "", fmt.Errorf("invalid amount: %.2f", amount)
+    }
+    
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Customer profile charge took %v", time.Since(startTime))
+    }()
+    
+    return s.client.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, billingInfo)
+}
 
+// UpdateSubscriptionAmount atualiza o valor de uma subscription ARB
+func (s *Service) UpdateSubscriptionAmount(subscriptionID string, newAmount float64) error {
+    log.Printf("Updating subscription %s to new amount: $%.2f", subscriptionID, newAmount)
+    
+    if newAmount <= 0 {
+        return fmt.Errorf("invalid amount: %.2f", newAmount)
+    }
+    
+    if subscriptionID == "" {
+        return fmt.Errorf("subscription ID is required")
+    }
+    
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Subscription update took %v", time.Since(startTime))
+    }()
+    
+    return s.client.UpdateSubscription(subscriptionID, newAmount)
+}
 // Função helper para validar o algoritmo de Luhn para números de cartão
 func validateLuhn(cardNumber string) bool {
     sum := 0

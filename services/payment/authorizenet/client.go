@@ -393,3 +393,157 @@ func (c *Client) VoidTransaction(transactionID string) error {
     log.Printf("Void transaction successful for transaction ID: %s", transactionID)
     return nil
 }
+func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, billingInfo *models.BillingInfo) (string, error) {
+    log.Printf("Charging customer profile %s/%s for amount $%.2f", customerProfileID, paymentProfileID, amount)
+    
+    txRequest := transactionRequestType{
+        TransactionType: "authCaptureTransaction",
+        Amount:         fmt.Sprintf("%.2f", amount),
+        Profile: &ProfileTransactionType{
+            CustomerProfileID: customerProfileID,
+            PaymentProfile: &PaymentProfileType{
+                PaymentProfileID: paymentProfileID,
+            },
+        },
+        Order: &OrderType{
+            InvoiceNumber: fmt.Sprintf("ADDPLAN-%d", time.Now().Unix()),
+            Description:   "Additional Plans Charge",
+        },
+    }
+
+    if billingInfo != nil {
+        txRequest.BillTo = &types.BillingInfoType{
+            FirstName: billingInfo.FirstName,
+            LastName:  billingInfo.LastName,
+            Address:   billingInfo.Address,
+            City:      billingInfo.City,
+            State:     billingInfo.State,
+            Zip:       billingInfo.Zip,
+            Country:   "US",
+        }
+    }
+
+    wrapper := createTransactionRequestWrapper{
+        CreateTransactionRequest: createTransactionRequest{
+            MerchantAuthentication: c.getMerchantAuthentication(),
+            RefID:                 c.normalizeRefID(fmt.Sprintf("CHARGE-%d", time.Now().Unix())),
+            TransactionRequest:    txRequest,
+        },
+    }
+
+    jsonPayload, err := json.Marshal(wrapper)
+    if err != nil {
+        return "", fmt.Errorf("error marshaling charge request: %v", err)
+    }
+
+    ctx, cancel := c.createRequestContext()
+    defer cancel()
+    
+    httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
+    if err != nil {
+        return "", fmt.Errorf("error creating charge request: %v", err)
+    }
+
+    httpReq.Header.Set("Content-Type", "application/json")
+
+    c.mutex.Lock()
+    resp, err := c.client.Do(httpReq)
+    c.mutex.Unlock()
+    
+    if err != nil {
+        return "", fmt.Errorf("error making charge request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    respBody, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("error reading charge response: %v", err)
+    }
+
+    cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")
+
+    var response createTransactionResponse
+    if err := json.Unmarshal([]byte(cleanBody), &response); err != nil {
+        return "", fmt.Errorf("error decoding charge response: %v", err)
+    }
+
+    if response.Messages.ResultCode == "Error" {
+        if len(response.Messages.Message) > 0 {
+            return "", fmt.Errorf("charge failed: %s", response.Messages.Message[0].Text)
+        }
+        return "", fmt.Errorf("charge failed with unknown error")
+    }
+
+    if response.TransactionResponse.ResponseCode != "1" {
+        message := "Transaction declined"
+        if len(response.TransactionResponse.Messages) > 0 {
+            message = response.TransactionResponse.Messages[0].Description
+        }
+        return "", fmt.Errorf("charge declined: %s", message)
+    }
+
+    log.Printf("Successfully charged customer profile: %s", response.TransactionResponse.TransID)
+    return response.TransactionResponse.TransID, nil
+}
+
+func (c *Client) UpdateSubscription(subscriptionID string, newAmount float64) error {
+    log.Printf("Updating subscription %s to amount $%.2f", subscriptionID, newAmount)
+
+    request := ARBUpdateSubscriptionRequest{
+        MerchantAuthentication: c.getMerchantAuthentication(),
+        RefID:                 c.normalizeRefID(fmt.Sprintf("UPD-%d", time.Now().Unix())),
+        SubscriptionID:        subscriptionID,
+        Subscription: ARBUpdateSubscriptionType{
+            Amount: fmt.Sprintf("%.2f", newAmount),
+        },
+    }
+
+    jsonPayload, err := json.Marshal(map[string]interface{}{
+        "ARBUpdateSubscriptionRequest": request,
+    })
+    if err != nil {
+        return fmt.Errorf("error marshaling update subscription request: %v", err)
+    }
+
+    ctx, cancel := c.createRequestContext()
+    defer cancel()
+    
+    httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonPayload))
+    if err != nil {
+        return fmt.Errorf("error creating update subscription request: %v", err)
+    }
+
+    httpReq.Header.Set("Content-Type", "application/json")
+
+    c.mutex.Lock()
+    resp, err := c.client.Do(httpReq)
+    c.mutex.Unlock()
+    
+    if err != nil {
+        return fmt.Errorf("error making update subscription request: %v", err)
+    }
+    defer resp.Body.Close()
+
+    respBody, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return fmt.Errorf("error reading update subscription response: %v", err)
+    }
+
+    cleanBody := strings.TrimPrefix(string(respBody), "\ufeff")
+
+    var response ARBResponse
+    if err := json.Unmarshal([]byte(cleanBody), &response); err != nil {
+        return fmt.Errorf("error decoding update subscription response: %v", err)
+    }
+
+    if response.Messages.ResultCode == "Error" {
+        message := "Subscription update failed"
+        if len(response.Messages.Message) > 0 {
+            message = response.Messages.Message[0].Text
+        }
+        return fmt.Errorf("subscription update failed: %s", message)
+    }
+
+    log.Printf("Successfully updated subscription %s", subscriptionID)
+    return nil
+}
