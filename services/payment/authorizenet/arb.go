@@ -1,4 +1,4 @@
-// services/payment/authorizenet/arb.go - VERSÃO COM DEBUGGING MELHORADO
+// services/payment/authorizenet/arb.go - VERSÃO CORRIGIDA PARA PRODUÇÃO
 package authorizenet
 
 import (
@@ -79,20 +79,6 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
     log.Printf("Creating subscription with customer profile, total amount: %.2f, interval: %d %s", 
         total, interval.Length, interval.Unit)
 
-    // Extrair nome e sobrenome
-    names := strings.Fields(checkout.Name)
-    firstName := names[0]
-    lastName := ""
-    if len(names) > 1 {
-        lastName = strings.Join(names[1:], " ")
-    }
-
-    // Formatar número de telefone
-    formattedPhone := formatPhoneNumber(checkout.PhoneNumber)
-    if formattedPhone == "" {
-        log.Printf("Warning: Could not format phone number %s, omitting from request", checkout.PhoneNumber)
-    }
-
     // Definir data de início para um mês após a data atual
     startDate := time.Now().AddDate(0, 1, 0).Format("2006-01-02") 
     log.Printf("Subscription start date: %s", startDate)
@@ -122,36 +108,30 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
             fmt.Sprintf("ProSecure Subscription - %s", checkout.Username), subscriptionName, maxNameLength)
     }
     
-    // Construir a requisição de assinatura usando Customer Profile
-    subscription := ARBSubscriptionRequestWithProfile{
-        MerchantAuthentication: c.getMerchantAuthentication(),
-        RefID: refId,
-        Subscription: ARBSubscriptionTypeWithProfile{
-            Name: subscriptionName,
-            PaymentSchedule: PaymentScheduleType{
-                Interval:         interval,
-                StartDate:       startDate,
-                TotalOccurrences: "9999", // Assinatura contínua
+    // CORREÇÃO CRÍTICA: Estrutura simplificada para ARB com Customer Profile
+    // NÃO incluir campos customer ou billTo quando usando profile
+    request := map[string]interface{}{
+        "ARBCreateSubscriptionRequest": map[string]interface{}{
+            "merchantAuthentication": map[string]interface{}{
+                "name":           c.apiLoginID,
+                "transactionKey": c.transactionKey,
             },
-            Amount: fmt.Sprintf("%.2f", total),
-            Profile: ProfileType{
-                CustomerProfileID:       customerProfileID,
-                CustomerPaymentProfileID: paymentProfileID,
-                // CustomerAddressID é opcional e não usado neste caso
-            },
-            Customer: CustomerType{
-                Type:        "individual",
-                Email:       checkout.Email,
-                PhoneNumber: formattedPhone,
-            },
-            BillTo: CustomerAddressType{
-                FirstName: firstName,
-                LastName:  lastName,
-                Address:   checkout.Street,
-                City:     checkout.City,
-                State:    checkout.State,
-                Zip:      checkout.ZipCode,
-                Country:  "US",
+            "refId": refId,
+            "subscription": map[string]interface{}{
+                "paymentSchedule": map[string]interface{}{
+                    "interval": map[string]interface{}{
+                        "length": interval.Length,
+                        "unit":   interval.Unit,
+                    },
+                    "startDate":        startDate,
+                    "totalOccurrences": "9999",
+                },
+                "amount": fmt.Sprintf("%.2f", total),
+                "profile": map[string]interface{}{
+                    "customerProfileId":        customerProfileID,
+                    "customerPaymentProfileId": paymentProfileID,
+                },
+                // REMOVIDO: customer e billTo - esses campos NÃO devem ser incluídos com profile
             },
         },
     }
@@ -161,9 +141,7 @@ func (c *Client) createSubscriptionWithProfile(payment *models.PaymentRequest, c
         refId, total, customerProfileID, paymentProfileID, subscriptionName)
 
     // Serializar para JSON
-    jsonPayload, err := json.Marshal(map[string]interface{}{
-        "ARBCreateSubscriptionRequest": subscription,
-    })
+    jsonPayload, err := json.Marshal(request)
     if err != nil {
         log.Printf("Error marshaling ARB subscription request: %v", err)
         return &models.SubscriptionResponse{
