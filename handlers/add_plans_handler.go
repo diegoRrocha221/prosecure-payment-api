@@ -165,7 +165,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // Validar CVV
+    // CRÍTICO: Validar CVV
     if req.CVV == "" || len(req.CVV) < 3 || len(req.CVV) > 4 {
         utils.SendErrorResponse(w, http.StatusBadRequest, "Valid CVV is required")
         return
@@ -210,9 +210,9 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 5. Fazer cobrança pro-rata usando Customer Profile
+    // 5. Fazer cobrança pro-rata usando Customer Profile COM CVV
     transactionID, err := h.chargeCustomerProfile(customerProfile.AuthorizeCustomerProfileID, 
-        customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount)
+        customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount, req.CVV)
     if err != nil {
         log.Printf("Error charging customer profile: %v", err)
         utils.SendErrorResponse(w, http.StatusPaymentRequired, fmt.Sprintf("Payment failed: %v", err))
@@ -385,11 +385,12 @@ func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.
     return &account, err
 }
 
-func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, account *models.MasterAccount) (string, error) {
-    log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
+// CORRIGIDO: Incluir CVV no método de cobrança
+func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, account *models.MasterAccount, cvv string) (string, error) {
+    log.Printf("Charging customer profile %s/%s amount: $%.2f with CVV validation", customerProfileID, paymentProfileID, amount)
 
-    // NÃO enviar billingInfo quando usar customer profile - já está armazenado no profile
-    return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, nil)
+    // CRÍTICO: Passar CVV para validação na Authorize.net
+    return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, cvv)
 }
 
 func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool, totalProRata float64) error {

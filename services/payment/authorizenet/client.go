@@ -395,9 +395,9 @@ func (c *Client) VoidTransaction(transactionID string) error {
     return nil
 }
 
-// CORRIGIDO: ChargeCustomerProfile - NÃO enviar billing info com customer profile
-func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, billingInfo *models.BillingInfo) (string, error) {
-    log.Printf("Charging customer profile %s/%s for amount $%.2f", customerProfileID, paymentProfileID, amount)
+// CORRIGIDO: ChargeCustomerProfile - Incluir CVV na request
+func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, cvv string) (string, error) {
+    log.Printf("Charging customer profile %s/%s for amount $%.2f with CVV validation", customerProfileID, paymentProfileID, amount)
     
     txRequest := transactionRequestType{
         TransactionType: "authCaptureTransaction",
@@ -406,6 +406,7 @@ func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID strin
             CustomerProfileID: customerProfileID,
             PaymentProfile: &PaymentProfileType{
                 PaymentProfileID: paymentProfileID,
+                CardCode:         cvv, // CRÍTICO: Incluir CVV aqui para validação
             },
         },
         Order: &OrderType{
@@ -413,10 +414,6 @@ func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID strin
             Description:   "Additional Plans Charge",
         },
     }
-
-    // REMOVIDO: Não enviar billing info com customer profile
-    // Customer profile já tem billing info armazenado
-    // if billingInfo != nil { ... }
 
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{
@@ -430,6 +427,8 @@ func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID strin
     if err != nil {
         return "", fmt.Errorf("error marshaling charge request: %v", err)
     }
+
+    log.Printf("Sending customer profile charge request with CVV validation")
 
     ctx, cancel := c.createRequestContext()
     defer cancel()
@@ -462,6 +461,12 @@ func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID strin
         return "", fmt.Errorf("error decoding charge response: %v", err)
     }
 
+    // Log da resposta para debugging (sem dados sensíveis)
+    log.Printf("Customer profile charge response - Result: %s", response.Messages.ResultCode)
+    if len(response.Messages.Message) > 0 {
+        log.Printf("Response message: %s", response.Messages.Message[0].Text)
+    }
+
     if response.Messages.ResultCode == "Error" {
         if len(response.Messages.Message) > 0 {
             return "", fmt.Errorf("charge failed: %s", response.Messages.Message[0].Text)
@@ -471,13 +476,26 @@ func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID strin
 
     if response.TransactionResponse.ResponseCode != "1" {
         message := "Transaction declined"
-        if len(response.TransactionResponse.Messages) > 0 {
+        
+        // Log dos erros da transação para debugging
+        if response.TransactionResponse.Errors != nil && len(response.TransactionResponse.Errors) > 0 {
+            for _, txErr := range response.TransactionResponse.Errors {
+                log.Printf("Transaction error: Code=%s, Text=%s", txErr.ErrorCode, txErr.ErrorText)
+                // CVV falhas são normalmente código 78 ou 79
+                if txErr.ErrorCode == "78" || txErr.ErrorCode == "79" {
+                    return "", fmt.Errorf("CVV verification failed: %s", txErr.ErrorText)
+                }
+            }
+            message = response.TransactionResponse.Errors[0].ErrorText
+        } else if len(response.TransactionResponse.Messages) > 0 {
             message = response.TransactionResponse.Messages[0].Description
         }
+        
         return "", fmt.Errorf("charge declined: %s", message)
     }
 
-    log.Printf("Successfully charged customer profile: %s", response.TransactionResponse.TransID)
+    log.Printf("Successfully charged customer profile: %s (Transaction ID: %s)", 
+        customerProfileID, response.TransactionResponse.TransID)
     return response.TransactionResponse.TransID, nil
 }
 

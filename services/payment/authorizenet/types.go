@@ -32,14 +32,13 @@ type transactionRequestType struct {
     TransactionType     string                    `json:"transactionType"`
     Amount             string                    `json:"amount,omitempty"`
     Payment            *PaymentType              `json:"payment,omitempty"`
-    Profile            *ProfileTransactionType   `json:"profile,omitempty"`  // ADICIONAR ESTA LINHA
+    Profile            *ProfileTransactionType   `json:"profile,omitempty"`
     RefTransId         string                    `json:"refTransId,omitempty"`
     Order              *OrderType                `json:"order,omitempty"`
     Customer           *CustomerType             `json:"customer,omitempty"`
     BillTo             *types.BillingInfoType    `json:"billTo,omitempty"`
     TransactionSettings *TransactionSettingsType `json:"transactionSettings,omitempty"`
 }
-
 
 type TransactionSettingsType struct {
     Settings []SettingType `json:"setting,omitempty"`
@@ -233,9 +232,10 @@ type ProfileTransactionType struct {
     PaymentProfile    *PaymentProfileType `json:"paymentProfile,omitempty"`
 }
 
+// CORRIGIDO: PaymentProfileType com CardCode para CVV
 type PaymentProfileType struct {
     PaymentProfileID string `json:"paymentProfileId"`
-    CardCode         string `json:"cardCode,omitempty"`
+    CardCode         string `json:"cardCode,omitempty"` // CRÍTICO: Campo para CVV
 }
 
 // Types for updating ARB subscription

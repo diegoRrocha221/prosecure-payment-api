@@ -269,12 +269,17 @@ func (s *Service) UpdateCustomerPaymentProfile(customerProfileID, paymentProfile
     return nil
 }
 
-// CORRIGIDO: ChargeCustomerProfile - NÃO enviar billing info para customer profile
-func (s *Service) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, billingInfo *models.BillingInfo) (string, error) {
-    log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
+// CORRIGIDO: ChargeCustomerProfile - Agora aceita CVV e valida
+func (s *Service) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, cvv string) (string, error) {
+    log.Printf("Charging customer profile %s/%s amount: $%.2f with CVV validation", customerProfileID, paymentProfileID, amount)
     
     if amount <= 0 {
         return "", fmt.Errorf("invalid amount: %.2f", amount)
+    }
+    
+    // CRÍTICO: Validar CVV
+    if cvv == "" || len(cvv) < 3 || len(cvv) > 4 {
+        return "", fmt.Errorf("invalid CVV provided: CVV must be 3-4 digits")
     }
     
     startTime := time.Now()
@@ -282,8 +287,8 @@ func (s *Service) ChargeCustomerProfile(customerProfileID, paymentProfileID stri
         log.Printf("Customer profile charge took %v", time.Since(startTime))
     }()
     
-    // Para customer profile, NÃO enviar billing info - já está armazenado no profile
-    return s.client.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, nil)
+    // Enviar CVV para Authorize.net para validação
+    return s.client.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, cvv)
 }
 
 // UpdateSubscriptionAmount atualiza o valor de uma subscription ARB
