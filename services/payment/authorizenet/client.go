@@ -13,7 +13,7 @@ import (
     "time"
     
     "prosecure-payment-api/models"
-    "prosecure-payment-api/types"
+   
 )
 
 const (
@@ -394,6 +394,8 @@ func (c *Client) VoidTransaction(transactionID string) error {
     log.Printf("Void transaction successful for transaction ID: %s", transactionID)
     return nil
 }
+
+// CORRIGIDO: ChargeCustomerProfile - NÃO enviar billing info com customer profile
 func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, billingInfo *models.BillingInfo) (string, error) {
     log.Printf("Charging customer profile %s/%s for amount $%.2f", customerProfileID, paymentProfileID, amount)
     
@@ -412,17 +414,9 @@ func (c *Client) ChargeCustomerProfile(customerProfileID, paymentProfileID strin
         },
     }
 
-    if billingInfo != nil {
-        txRequest.BillTo = &types.BillingInfoType{
-            FirstName: billingInfo.FirstName,
-            LastName:  billingInfo.LastName,
-            Address:   billingInfo.Address,
-            City:      billingInfo.City,
-            State:     billingInfo.State,
-            Zip:       billingInfo.Zip,
-            Country:   "US",
-        }
-    }
+    // REMOVIDO: Não enviar billing info com customer profile
+    // Customer profile já tem billing info armazenado
+    // if billingInfo != nil { ... }
 
     wrapper := createTransactionRequestWrapper{
         CreateTransactionRequest: createTransactionRequest{

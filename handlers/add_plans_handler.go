@@ -22,6 +22,7 @@ type AddPlansHandler struct {
 
 type AddPlansRequest struct {
     Cart []CartPlan `json:"cart"`
+    CVV  string     `json:"cvv"` // Adicionar CVV para verificação
 }
 
 type CartPlan struct {
@@ -161,6 +162,12 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    // Validar CVV
+    if req.CVV == "" || len(req.CVV) < 3 || len(req.CVV) > 4 {
+        utils.SendErrorResponse(w, http.StatusBadRequest, "Valid CVV is required")
+        return
+    }
+
     log.Printf("Processing add plans for user: %s, cart items: %d", user.Username, len(req.Cart))
 
     // 1. Buscar dados da conta master
@@ -200,7 +207,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 5. Fazer cobrança pro-rata usando Customer Profile
+    // 5. Fazer cobrança pro-rata usando Customer Profile (SEM billing info)
     transactionID, err := h.chargeCustomerProfile(customerProfile.AuthorizeCustomerProfileID, 
         customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount)
     if err != nil {
@@ -375,20 +382,12 @@ func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.
     return &account, err
 }
 
+// CORRIGIDO: Não enviar billing info quando usar customer profile
 func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, account *models.MasterAccount) (string, error) {
     log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
 
-    billingInfo := &models.BillingInfo{
-        FirstName: account.Name,
-        LastName:  account.LastName,
-        Address:   account.Street,
-        City:      account.City,
-        State:     account.State,
-        Zip:       account.ZipCode,
-        Country:   "US",
-    }
-
-    return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, billingInfo)
+    // NÃO enviar billingInfo quando usar customer profile - já está armazenado no profile
+    return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, nil)
 }
 
 func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool) error {

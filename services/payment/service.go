@@ -266,6 +266,8 @@ func (s *Service) UpdateCustomerPaymentProfile(customerProfileID, paymentProfile
     log.Printf("Successfully updated customer payment profile: %s/%s", customerProfileID, paymentProfileID)
     return nil
 }
+
+// CORRIGIDO: ChargeCustomerProfile - NÃO enviar billing info para customer profile
 func (s *Service) ChargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, billingInfo *models.BillingInfo) (string, error) {
     log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
     
@@ -278,7 +280,8 @@ func (s *Service) ChargeCustomerProfile(customerProfileID, paymentProfileID stri
         log.Printf("Customer profile charge took %v", time.Since(startTime))
     }()
     
-    return s.client.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, billingInfo)
+    // Para customer profile, NÃO enviar billing info - já está armazenado no profile
+    return s.client.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, nil)
 }
 
 // UpdateSubscriptionAmount atualiza o valor de uma subscription ARB
@@ -300,6 +303,7 @@ func (s *Service) UpdateSubscriptionAmount(subscriptionID string, newAmount floa
     
     return s.client.UpdateSubscription(subscriptionID, newAmount)
 }
+
 // Função helper para validar o algoritmo de Luhn para números de cartão
 func validateLuhn(cardNumber string) bool {
     sum := 0
