@@ -12,17 +12,19 @@ import (
     "prosecure-payment-api/middleware"
     "prosecure-payment-api/models"
     "prosecure-payment-api/services/payment"
+    "prosecure-payment-api/services/email"
     "prosecure-payment-api/utils"
 )
 
 type AddPlansHandler struct {
     db             *database.Connection
     paymentService *payment.Service
+    emailService   *email.SMTPService
 }
 
 type AddPlansRequest struct {
     Cart []CartPlan `json:"cart"`
-    CVV  string     `json:"cvv"` // Adicionar CVV para verificação
+    CVV  string     `json:"cvv"`
 }
 
 type CartPlan struct {
@@ -61,10 +63,11 @@ type PurchasedPlan struct {
     IsMaster int    `json:"is_master"`
 }
 
-func NewAddPlansHandler(db *database.Connection, ps *payment.Service) *AddPlansHandler {
+func NewAddPlansHandler(db *database.Connection, ps *payment.Service, es *email.SMTPService) *AddPlansHandler {
     return &AddPlansHandler{
         db:             db,
         paymentService: ps,
+        emailService:   es,
     }
 }
 
@@ -207,7 +210,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 5. Fazer cobrança pro-rata usando Customer Profile (SEM billing info)
+    // 5. Fazer cobrança pro-rata usando Customer Profile
     transactionID, err := h.chargeCustomerProfile(customerProfile.AuthorizeCustomerProfileID, 
         customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount)
     if err != nil {
@@ -217,7 +220,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
     }
 
     // 6. Atualizar dados no banco de dados
-    err = h.updateAccountWithNewPlans(masterAccount, req.Cart, planCalculations, totalMonthlyIncrease, transactionID, isAnnualUser)
+    err = h.updateAccountWithNewPlans(masterAccount, req.Cart, planCalculations, totalMonthlyIncrease, transactionID, isAnnualUser, totalProRata)
     if err != nil {
         log.Printf("Error updating account: %v", err)
         utils.SendErrorResponse(w, http.StatusInternalServerError, "Failed to update account")
@@ -382,7 +385,6 @@ func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.
     return &account, err
 }
 
-// CORRIGIDO: Não enviar billing info quando usar customer profile
 func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, account *models.MasterAccount) (string, error) {
     log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
 
@@ -390,7 +392,7 @@ func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfil
     return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, nil)
 }
 
-func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool) error {
+func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool, totalProRata float64) error {
     tx, err := h.db.BeginTransaction()
     if err != nil {
         return fmt.Errorf("failed to begin transaction: %v", err)
@@ -468,28 +470,135 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
     _, err = h.db.GetDB().ExecContext(ctx, `
         INSERT INTO transactions (id, master_reference, checkout_id, amount, status, transaction_id, created_at)
         VALUES (UUID(), ?, 'ADD_PLANS', ?, 'captured', ?, NOW())`,
-        account.ReferenceUUID, utils.Round(monthlyIncrease), transactionID)
+        account.ReferenceUUID, utils.Round(totalProRata), transactionID)
     
     if err != nil {
         return fmt.Errorf("failed to save transaction: %v", err)
     }
 
-    // Criar nova invoice para os planos adicionados
-    dueDate := time.Now().AddDate(0, 1, 0)
-    if isAnnualUser {
-        dueDate = time.Now().AddDate(1, 0, 0) // 1 ano para usuários anuais
-    }
-
+    // 1. CRIAR INVOICE DO PRO-RATA (PAGA)
     _, err = h.db.GetDB().ExecContext(ctx, `
         INSERT INTO invoices (master_reference, is_trial, total, due_date, is_paid, created_at)
-        VALUES (?, 0, ?, ?, 0, NOW())`,
-        account.ReferenceUUID, utils.Round(monthlyIncrease), dueDate)
+        VALUES (?, 0, ?, NOW(), 1, NOW())`,
+        account.ReferenceUUID, utils.Round(totalProRata))
     
     if err != nil {
-        return fmt.Errorf("failed to create invoice: %v", err)
+        return fmt.Errorf("failed to create prorata invoice: %v", err)
     }
 
-    return tx.Commit()
+    // 2. ATUALIZAR OU CRIAR INVOICE DO PRÓXIMO MES/ANO (PENDING)
+    dueDate := time.Now().AddDate(0, 1, 0)
+    if isAnnualUser {
+        dueDate = time.Now().AddDate(1, 0, 0)
+    }
+
+    // Verificar se já existe invoice future pendente
+    var existingInvoiceTotal float64
+    var existingInvoiceID string
+    err = h.db.GetDB().QueryRowContext(ctx, `
+        SELECT id, total FROM invoices 
+        WHERE master_reference = ? AND is_paid = 0 AND due_date > NOW()
+        ORDER BY due_date ASC LIMIT 1`,
+        account.ReferenceUUID).Scan(&existingInvoiceID, &existingInvoiceTotal)
+
+    if err == nil {
+        // Atualizar invoice existente
+        newFutureTotal := existingInvoiceTotal + monthlyIncrease
+        _, err = h.db.GetDB().ExecContext(ctx, `
+            UPDATE invoices SET total = ? WHERE id = ?`,
+            utils.Round(newFutureTotal), existingInvoiceID)
+        
+        if err != nil {
+            return fmt.Errorf("failed to update future invoice: %v", err)
+        }
+        log.Printf("Updated existing future invoice %s with new total: %.2f", existingInvoiceID, newFutureTotal)
+    } else {
+        // Criar nova invoice future
+        _, err = h.db.GetDB().ExecContext(ctx, `
+            INSERT INTO invoices (master_reference, is_trial, total, due_date, is_paid, created_at)
+            VALUES (?, 0, ?, ?, 0, NOW())`,
+            account.ReferenceUUID, utils.Round(monthlyIncrease), dueDate)
+        
+        if err != nil {
+            return fmt.Errorf("failed to create future invoice: %v", err)
+        }
+        log.Printf("Created new future invoice with total: %.2f", monthlyIncrease)
+    }
+
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf("failed to commit transaction: %v", err)
+    }
+
+    // 3. ENVIAR EMAIL DA INVOICE PRO-RATA (APÓS COMMIT)
+    go func() {
+        err := h.sendProRataInvoiceEmail(account, planCalculations, totalProRata)
+        if err != nil {
+            log.Printf("Warning: Failed to send prorata invoice email: %v", err)
+        } else {
+            log.Printf("Pro-rata invoice email sent successfully to %s", account.Email)
+        }
+    }()
+
+    return nil
+}
+
+func (h *AddPlansHandler) sendProRataInvoiceEmail(account *models.MasterAccount, planCalculations []PlanCalculation, totalProRata float64) error {
+    // Gerar tabela de planos adicionados
+    plansTable := `<table class="plans-table">
+        <thead>
+            <tr>
+                <th>Plan Name</th>
+                <th>Quantity</th>
+                <th>Pro-rata Price</th>
+                <th>Total</th>
+            </tr>
+        </thead>
+        <tbody>`
+    
+    for _, plan := range planCalculations {
+        plansTable += fmt.Sprintf(`
+            <tr>
+                <td>%s</td>
+                <td>%d</td>
+                <td>$%.2f</td>
+                <td>$%.2f</td>
+            </tr>`, 
+            plan.PlanName,
+            plan.Quantity,
+            plan.ProRata,
+            plan.TotalProRata,
+        )
+    }
+    plansTable += `</tbody></table>`
+
+    // Seção de totais
+    totalsSection := fmt.Sprintf(`
+        <p><strong>Pro-rata Amount:</strong> $%.2f</p>
+        <p style="font-size: 18px; font-weight: bold; color: #28a745;"><strong>Total Paid:</strong> $%.2f</p>
+    `, totalProRata, totalProRata)
+
+    footer := fmt.Sprintf(
+        "Thank you %s for adding plans to your ProSecureLSP account. Your new services are now active.",
+        account.Name,
+    )
+
+    // Gerar número da invoice único
+    invoiceNumber := fmt.Sprintf("ADDPLAN-%s", time.Now().Format("20060102-150405"))
+
+    emailContent := fmt.Sprintf(
+        email.InvoiceEmailTemplate,
+        invoiceNumber,   // %s - Invoice number
+        plansTable,      // %s - Plans table HTML
+        totalsSection,   // %s - Totals section HTML
+        "Paid",          // %s - Status
+        footer,          // %s - Footer message
+    )
+
+    return h.emailService.SendEmail(
+        account.Email,
+        "Invoice: Additional Plans Added - ProSecureLSP",
+        emailContent,
+    )
 }
 
 func (h *AddPlansHandler) updateARBSubscription(masterReference string, newMonthlyTotal float64) error {

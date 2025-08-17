@@ -280,7 +280,7 @@ func main() {
     protectedRouter.Use(middleware.AuthMiddleware(jwtService))
     protectedRouter.Use(middleware.AllowPaymentError()) // Permite payment_error para update de cartão
 
-    addPlansHandler := handlers.NewAddPlansHandler(db, paymentService)
+    addPlansHandler := handlers.NewAddPlansHandler(db, paymentService, emailService)
     addPlansProtectedPaymentHandler := handlers.NewAddPlansProtectedPaymentHandler(db)
     
     protectedRouter.HandleFunc("/add-plans", addPlansHandler.AddPlans).Methods("POST", "OPTIONS")
@@ -289,7 +289,7 @@ func main() {
     protectedRouter.HandleFunc("/update-payment", protectedPaymentHandler.UpdatePaymentMethod).Methods("POST", "OPTIONS")
     protectedRouter.HandleFunc("/account", protectedPaymentHandler.GetAccountDetails).Methods("GET", "OPTIONS")
     protectedRouter.HandleFunc("/payment-history", protectedPaymentHandler.GetPaymentHistory).Methods("GET", "OPTIONS")
-    
+
     // Endpoints que requerem conta master
     masterOnlyRouter := protectedRouter.PathPrefix("").Subrouter()
     masterOnlyRouter.Use(middleware.RequireMaster())
