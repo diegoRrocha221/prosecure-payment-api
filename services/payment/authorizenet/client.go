@@ -13,6 +13,7 @@ import (
     "time"
     
     "prosecure-payment-api/models"
+    "prosecure-payment-api/types"
 )
 
 const (

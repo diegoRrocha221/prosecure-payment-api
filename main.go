@@ -258,9 +258,7 @@ func main() {
     authProtectedRouter.HandleFunc("/logout", authHandler.Logout).Methods("POST", "OPTIONS")
     authProtectedRouter.HandleFunc("/status", authHandler.GetAccountStatus).Methods("GET", "OPTIONS")
     authProtectedRouter.HandleFunc("/change-password", authHandler.ChangePassword).Methods("POST", "OPTIONS")
-    addPlansHandler := handlers.NewAddPlansHandler(db, paymentService)
-    protectedRouter.HandleFunc("/add-plans", addPlansHandler.AddPlans).Methods("POST", "OPTIONS")
-    protectedRouter.HandleFunc("/preview-add-plans", addPlansHandler.PreviewAddPlans).Methods("POST", "OPTIONS")
+
 
     // ===========================================
     // ROTAS INTERNAS (PARA INTEGRAÇÃO PHP)
@@ -282,7 +280,9 @@ func main() {
     protectedRouter.Use(middleware.AuthMiddleware(jwtService))
     protectedRouter.Use(middleware.AllowPaymentError()) // Permite payment_error para update de cartão
 
-    // Endpoints protegidos de pagamento
+    addPlansHandler := handlers.NewAddPlansHandler(db, paymentService)
+    protectedRouter.HandleFunc("/add-plans", addPlansHandler.AddPlans).Methods("POST", "OPTIONS")
+    protectedRouter.HandleFunc("/preview-add-plans", addPlansHandler.PreviewAddPlans).Methods("POST", "OPTIONS")
     protectedRouter.HandleFunc("/update-payment", protectedPaymentHandler.UpdatePaymentMethod).Methods("POST", "OPTIONS")
     protectedRouter.HandleFunc("/account", protectedPaymentHandler.GetAccountDetails).Methods("GET", "OPTIONS")
     protectedRouter.HandleFunc("/payment-history", protectedPaymentHandler.GetPaymentHistory).Methods("GET", "OPTIONS")
