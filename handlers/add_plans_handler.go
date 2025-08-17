@@ -51,6 +51,15 @@ type AddPlansResponse struct {
     UserType         string             `json:"user_type"`
 }
 
+type PurchasedPlan struct {
+    PlanID   int    `json:"plan_id"`
+    PlanName string `json:"plan_name"`
+    Annually int    `json:"anually"` 
+    Username string `json:"username"`
+    Email    string `json:"email"`
+    IsMaster int    `json:"is_master"`
+}
+
 func NewAddPlansHandler(db *database.Connection, ps *payment.Service) *AddPlansHandler {
     return &AddPlansHandler{
         db:             db,
@@ -95,15 +104,22 @@ func (h *AddPlansHandler) PreviewAddPlans(w http.ResponseWriter, r *http.Request
         return
     }
 
+    // Determinar se é usuário anual baseado no purchased_plans JSON
+    isAnnualUser, err := h.isAnnualUser(masterAccount.PurchasedPlans)
+    if err != nil {
+        utils.SendErrorResponse(w, http.StatusInternalServerError, "Error determining billing type")
+        return
+    }
+
     // Calcular custos sem processar pagamento
-    planCalculations, totalProRata, totalMonthlyIncrease, err := h.calculatePlansFromDatabase(req.Cart, masterAccount.IsAnnually == 1, masterAccount.RenewDate)
+    planCalculations, totalProRata, totalMonthlyIncrease, err := h.calculatePlansFromDatabase(req.Cart, isAnnualUser, masterAccount.RenewDate)
     if err != nil {
         utils.SendErrorResponse(w, http.StatusBadRequest, err.Error())
         return
     }
 
     userType := "monthly"
-    if masterAccount.IsAnnually == 1 {
+    if isAnnualUser {
         userType = "annual"
     }
 
@@ -155,7 +171,15 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 2. Buscar Customer Profile
+    // 2. Determinar se é usuário anual baseado no purchased_plans JSON
+    isAnnualUser, err := h.isAnnualUser(masterAccount.PurchasedPlans)
+    if err != nil {
+        log.Printf("Error determining billing type: %v", err)
+        utils.SendErrorResponse(w, http.StatusInternalServerError, "Error determining billing type")
+        return
+    }
+
+    // 3. Buscar Customer Profile
     customerProfile, err := h.db.GetCustomerProfile(masterAccount.ReferenceUUID)
     if err != nil {
         log.Printf("Error getting customer profile: %v", err)
@@ -163,8 +187,8 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 3. Buscar planos do banco de dados e calcular custos
-    planCalculations, totalProRata, totalMonthlyIncrease, err := h.calculatePlansFromDatabase(req.Cart, masterAccount.IsAnnually == 1, masterAccount.RenewDate)
+    // 4. Buscar planos do banco de dados e calcular custos
+    planCalculations, totalProRata, totalMonthlyIncrease, err := h.calculatePlansFromDatabase(req.Cart, isAnnualUser, masterAccount.RenewDate)
     if err != nil {
         log.Printf("Error calculating plans: %v", err)
         utils.SendErrorResponse(w, http.StatusBadRequest, err.Error())
@@ -176,7 +200,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 4. Fazer cobrança pro-rata usando Customer Profile
+    // 5. Fazer cobrança pro-rata usando Customer Profile
     transactionID, err := h.chargeCustomerProfile(customerProfile.AuthorizeCustomerProfileID, 
         customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount)
     if err != nil {
@@ -185,15 +209,15 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 5. Atualizar dados no banco de dados
-    err = h.updateAccountWithNewPlans(masterAccount, req.Cart, planCalculations, totalMonthlyIncrease, transactionID)
+    // 6. Atualizar dados no banco de dados
+    err = h.updateAccountWithNewPlans(masterAccount, req.Cart, planCalculations, totalMonthlyIncrease, transactionID, isAnnualUser)
     if err != nil {
         log.Printf("Error updating account: %v", err)
         utils.SendErrorResponse(w, http.StatusInternalServerError, "Failed to update account")
         return
     }
 
-    // 6. Atualizar ARB subscription com novo valor
+    // 7. Atualizar ARB subscription com novo valor
     newMonthlyTotal := masterAccount.TotalPrice + totalMonthlyIncrease
     err = h.updateARBSubscription(masterAccount.ReferenceUUID, newMonthlyTotal)
     if err != nil {
@@ -201,7 +225,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
     }
 
     userType := "monthly"
-    if masterAccount.IsAnnually == 1 {
+    if isAnnualUser {
         userType = "annual"
     }
 
@@ -223,26 +247,28 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
     })
 }
 
-func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.MasterAccount, error) {
-    query := `
-        SELECT reference_uuid, name, lname, email, username, phone_number,
-               state, city, street, zip_code, additional_info, total_price,
-               is_annually, plan, purchased_plans, simultaneus_users, renew_date
-        FROM master_accounts 
-        WHERE username = ? AND email = ?
-    `
+func (h *AddPlansHandler) isAnnualUser(purchasedPlansJSON string) (bool, error) {
+    if purchasedPlansJSON == "" {
+        return false, nil // Default para mensal se não houver planos
+    }
 
-    var account models.MasterAccount
-    err := h.db.GetDB().QueryRow(query, username, email).Scan(
-        &account.ReferenceUUID, &account.Name, &account.LastName,
-        &account.Email, &account.Username, &account.PhoneNumber,
-        &account.State, &account.City, &account.Street,
-        &account.ZipCode, &account.AdditionalInfo, &account.TotalPrice,
-        &account.IsAnnually, &account.Plan, &account.PurchasedPlans,
-        &account.SimultaneousUsers, &account.RenewDate,
-    )
+    var plans []PurchasedPlan
+    if err := json.Unmarshal([]byte(purchasedPlansJSON), &plans); err != nil {
+        return false, fmt.Errorf("error parsing purchased_plans JSON: %v", err)
+    }
 
-    return &account, err
+    if len(plans) == 0 {
+        return false, nil // Default para mensal se não houver planos
+    }
+
+    // Verificar o primeiro plano para determinar o tipo de billing
+    // Como explicado, todos os planos de um usuário têm o mesmo tipo (anual ou mensal)
+    isAnnual := plans[0].Annually == 1
+    
+    log.Printf("User billing type determined: %s (based on %d plans)", 
+        map[bool]string{true: "annual", false: "monthly"}[isAnnual], len(plans))
+    
+    return isAnnual, nil
 }
 
 func (h *AddPlansHandler) calculatePlansFromDatabase(cart []CartPlan, isAnnualUser bool, renewDate time.Time) ([]PlanCalculation, float64, float64, error) {
@@ -327,6 +353,28 @@ func (h *AddPlansHandler) calculatePlansFromDatabase(cart []CartPlan, isAnnualUs
     return planCalculations, utils.Round(totalProRata), utils.Round(totalMonthlyIncrease), nil
 }
 
+func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.MasterAccount, error) {
+    query := `
+        SELECT reference_uuid, name, lname, email, username, phone_number,
+               state, city, street, zip_code, additional_info, total_price,
+               is_annually, plan, purchased_plans, simultaneus_users, renew_date
+        FROM master_accounts 
+        WHERE username = ? AND email = ?
+    `
+
+    var account models.MasterAccount
+    err := h.db.GetDB().QueryRow(query, username, email).Scan(
+        &account.ReferenceUUID, &account.Name, &account.LastName,
+        &account.Email, &account.Username, &account.PhoneNumber,
+        &account.State, &account.City, &account.Street,
+        &account.ZipCode, &account.AdditionalInfo, &account.TotalPrice,
+        &account.IsAnnually, &account.Plan, &account.PurchasedPlans,
+        &account.SimultaneousUsers, &account.RenewDate,
+    )
+
+    return &account, err
+}
+
 func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfileID string, amount float64, account *models.MasterAccount) (string, error) {
     log.Printf("Charging customer profile %s/%s amount: $%.2f", customerProfileID, paymentProfileID, amount)
 
@@ -343,7 +391,7 @@ func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfil
     return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, billingInfo)
 }
 
-func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string) error {
+func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool) error {
     tx, err := h.db.BeginTransaction()
     if err != nil {
         return fmt.Errorf("failed to begin transaction: %v", err)
@@ -355,7 +403,7 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
     }()
 
     // Parse purchased plans existentes
-    var existingPlans []map[string]interface{}
+    var existingPlans []PurchasedPlan
     if account.PurchasedPlans != "" {
         if err := json.Unmarshal([]byte(account.PurchasedPlans), &existingPlans); err != nil {
             return fmt.Errorf("failed to parse existing plans: %v", err)
@@ -364,6 +412,11 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
 
     // Adicionar novos planos
     simultaneousUsersIncrease := 0
+    annuallyFlag := 0
+    if isAnnualUser {
+        annuallyFlag = 1
+    }
+
     for _, item := range cart {
         // Buscar dados do plano calculado
         var planCalc *PlanCalculation
@@ -379,13 +432,13 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
         }
 
         for i := 0; i < item.Quantity; i++ {
-            newPlan := map[string]interface{}{
-                "plan_id":   planCalc.PlanID,
-                "username":  "none",
-                "email":     "none",
-                "is_master": 0,
-                "plan_name": planCalc.PlanName,
-                "annually":  account.IsAnnually, // Manter o mesmo tipo do usuário
+            newPlan := PurchasedPlan{
+                PlanID:   planCalc.PlanID,
+                PlanName: planCalc.PlanName,
+                Annually: annuallyFlag, // Usar o tipo de billing do usuário
+                Username: "none",
+                Email:    "none",
+                IsMaster: 0,
             }
             existingPlans = append(existingPlans, newPlan)
             simultaneousUsersIncrease++
@@ -423,10 +476,15 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
     }
 
     // Criar nova invoice para os planos adicionados
+    dueDate := time.Now().AddDate(0, 1, 0)
+    if isAnnualUser {
+        dueDate = time.Now().AddDate(1, 0, 0) // 1 ano para usuários anuais
+    }
+
     _, err = h.db.GetDB().ExecContext(ctx, `
         INSERT INTO invoices (master_reference, is_trial, total, due_date, is_paid, created_at)
         VALUES (?, 0, ?, ?, 0, NOW())`,
-        account.ReferenceUUID, utils.Round(monthlyIncrease), time.Now().AddDate(0, 1, 0))
+        account.ReferenceUUID, utils.Round(monthlyIncrease), dueDate)
     
     if err != nil {
         return fmt.Errorf("failed to create invoice: %v", err)
