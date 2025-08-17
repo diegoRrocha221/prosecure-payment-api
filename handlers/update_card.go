@@ -288,10 +288,26 @@ func (h *UpdateCardHandler) processPaymentOperationsFast(ctx context.Context, re
         go func() {
             checkoutData := h.convertMasterAccountToCheckoutData(master)
             
-            if err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData); err != nil {
+            if subscriptionID, err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData); err != nil {
                 log.Printf("[UpdateCard %s] Warning: Failed to setup ARB in background: %v", requestID, err)
                 // TODO: Poderia retentar ou notificar admin
             } else {
+                if subscriptionID != "" {
+                    updateCtx, updateCancel := context.WithTimeout(context.Background(), 10*time.Second)
+                    defer updateCancel()
+                    
+                    _, updateErr := h.db.GetDB().ExecContext(updateCtx,
+                        `UPDATE subscriptions 
+                         SET subscription_id = ?, status = 'active', updated_at = NOW()
+                         WHERE master_reference = ?`,
+                        subscriptionID, master.ReferenceUUID)
+                    
+                    if updateErr != nil {
+                        log.Printf("[UpdateCard %s] Warning: Failed to update subscription with new ID: %v", requestID, updateErr)
+                    } else {
+                        log.Printf("[UpdateCard %s] Successfully updated subscription with new ID: %s", requestID, subscriptionID)
+                    }
+                }
                 log.Printf("[UpdateCard %s] ARB setup completed in background", requestID)
             }
         }()

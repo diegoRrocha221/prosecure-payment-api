@@ -387,93 +387,128 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
     // ETAPA 4: Criar ARB (assinatura recorrente) usando o Customer Profile
     log.Printf("[RequestID: %s] Step 4: Creating subscription (ARB) using Customer Profile", requestID)
     
-    subscriptionErr := w.paymentService.SetupRecurringBilling(paymentReq, checkout)
+    subscriptionID, subscriptionErr := w.paymentService.SetupRecurringBilling(paymentReq, checkout)
     if subscriptionErr != nil {
         log.Printf("[RequestID: %s] Failed to setup subscription with customer profile: %v", requestID, subscriptionErr)
         isLastAttempt := w.isLastAttempt(job)
         return w.handlePaymentFailure(checkout, requestID, fmt.Sprintf("Failed to setup subscription: %v", subscriptionErr), isLastAttempt)
     }
-    
-    log.Printf("[RequestID: %s] Subscription created successfully using Customer Profile", requestID)
-    
+
+    log.Printf("[RequestID: %s] Subscription created successfully using Customer Profile - Subscription ID: %s", requestID, subscriptionID)
+
     // ETAPA 5: Salvar Customer Profile IDs no banco de dados para uso futuro
     log.Printf("[RequestID: %s] Step 5: Saving Customer Profile IDs to database", requestID)
 
-// CORREÇÃO: Usar contexto com timeout maior para operações de banco
-dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-defer dbCancel()
+    // CORREÇÃO: Usar contexto com timeout maior para operações de banco
+    dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer dbCancel()
 
-// Buscar o master_reference da conta que já foi criada
-var masterRef string
-masterErr := w.db.GetDB().QueryRowContext(dbCtx, 
-    `SELECT reference_uuid FROM master_accounts 
-     WHERE username = ? AND email = ? LIMIT 1`,
-    checkout.Username, checkout.Email).Scan(&masterRef)
+    // Buscar o master_reference da conta que já foi criada
+    var masterRef string
+    masterErr := w.db.GetDB().QueryRowContext(dbCtx, 
+        `SELECT reference_uuid FROM master_accounts 
+         WHERE username = ? AND email = ? LIMIT 1`,
+        checkout.Username, checkout.Email).Scan(&masterRef)
 
-if masterErr != nil {
-    log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, masterErr)
-    
-    // CORREÇÃO: Tentar buscar pela transação em vez da master account
-    transactionErr := w.db.GetDB().QueryRowContext(dbCtx,
-        `SELECT master_reference FROM transactions 
-         WHERE checkout_id = ? AND status = 'authorized' 
-         ORDER BY created_at DESC LIMIT 1`,
-        checkoutID).Scan(&masterRef)
-    
-    if transactionErr != nil {
-        log.Printf("[RequestID: %s] Warning: Could not find master reference via transaction: %v", requestID, transactionErr)
-        // Mesmo assim, considera sucesso pois o pagamento funcionou
+    if masterErr != nil {
+        log.Printf("[RequestID: %s] Warning: Could not find master account: %v", requestID, masterErr)
+
+        // CORREÇÃO: Tentar buscar pela transação em vez da master account
+        transactionErr := w.db.GetDB().QueryRowContext(dbCtx,
+            `SELECT master_reference FROM transactions 
+             WHERE checkout_id = ? AND status = 'authorized' 
+             ORDER BY created_at DESC LIMIT 1`,
+            checkoutID).Scan(&masterRef)
+        
+        if transactionErr != nil {
+            log.Printf("[RequestID: %s] Warning: Could not find master reference via transaction: %v", requestID, transactionErr)
+            // Mesmo assim, considera sucesso pois o pagamento funcionou
+        } else {
+            log.Printf("[RequestID: %s] Found master reference via transaction: %s", requestID, masterRef)
+        }
     } else {
-        log.Printf("[RequestID: %s] Found master reference via transaction: %s", requestID, masterRef)
+        log.Printf("[RequestID: %s] Found master reference via master_accounts: %s", requestID, masterRef)
     }
-} else {
-    log.Printf("[RequestID: %s] Found master reference via master_accounts: %s", requestID, masterRef)
-}
 
-// Se encontrou o master reference, salvar Customer Profile IDs
-if masterRef != "" {
-    profileSaveErr := w.db.SaveCustomerProfile(masterRef, customerProfileID, paymentProfileID)
-    if profileSaveErr != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to save customer profile IDs: %v", requestID, profileSaveErr)
-        // Não falha o processo pois o pagamento já funcionou
+    // Se encontrou o master reference, salvar Customer Profile IDs e atualizar subscription
+    if masterRef != "" {
+        profileSaveErr := w.db.SaveCustomerProfile(masterRef, customerProfileID, paymentProfileID)
+        if profileSaveErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to save customer profile IDs: %v", requestID, profileSaveErr)
+            // Não falha o processo pois o pagamento já funcionou
+        } else {
+            log.Printf("[RequestID: %s] Customer Profile IDs saved successfully for future use", requestID)
+        }
+
+        // NOVA CORREÇÃO: Atualizar a tabela subscriptions com o subscription ID da Authorize.net
+        log.Printf("[RequestID: %s] Step 6: Updating subscriptions table with Authorize.net subscription ID", requestID)
+
+        _, subscriptionUpdateErr := w.db.GetDB().ExecContext(dbCtx,
+            `UPDATE subscriptions 
+             SET status = 'active', 
+                 subscription_id = ?, 
+                 updated_at = NOW()
+             WHERE master_reference = ? AND status = 'pending'`,
+            subscriptionID, masterRef)
+        
+        if subscriptionUpdateErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to update subscription status: %v", requestID, subscriptionUpdateErr)
+
+            // Tentar inserir se não existir
+            _, insertErr := w.db.GetDB().ExecContext(dbCtx,
+                `INSERT INTO subscriptions 
+                 (id, master_reference, status, subscription_id, next_billing_date, created_at)
+                 VALUES (UUID(), ?, 'active', ?, DATE_ADD(NOW(), INTERVAL 1 MONTH), NOW())
+                 ON DUPLICATE KEY UPDATE
+                 status = 'active',
+                 subscription_id = ?,
+                 updated_at = NOW()`,
+                masterRef, subscriptionID, subscriptionID)
+            
+            if insertErr != nil {
+                log.Printf("[RequestID: %s] Warning: Failed to insert/update subscription: %v", requestID, insertErr)
+            } else {
+                log.Printf("[RequestID: %s] Successfully inserted/updated subscription with ID: %s", requestID, subscriptionID)
+            }
+        } else {
+            log.Printf("[RequestID: %s] Successfully updated subscription status to active with ID: %s", requestID, subscriptionID)
+        }
+
+        // Atualizar a transação pendente com o ID real
+        _, updateErr := w.db.GetDB().ExecContext(dbCtx,
+            `UPDATE transactions 
+             SET transaction_id = ?, status = 'authorized', updated_at = NOW()
+             WHERE master_reference = ? AND transaction_id = 'PENDING'`,
+            transactionID, masterRef)
+        
+        if updateErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, updateErr)
+        }
     } else {
-        log.Printf("[RequestID: %s] Customer Profile IDs saved successfully for future use", requestID)
+        log.Printf("[RequestID: %s] Could not find master reference - Customer Profile IDs and subscription not updated", requestID)
     }
-    
-    // Atualizar a transação pendente com o ID real
-    _, updateErr := w.db.GetDB().ExecContext(dbCtx,
-        `UPDATE transactions 
-         SET transaction_id = ?, status = 'authorized', updated_at = NOW()
-         WHERE master_reference = ? AND transaction_id = 'PENDING'`,
-        transactionID, masterRef)
-    
-    if updateErr != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to update transaction: %v", requestID, updateErr)
+
+    // Atualizar status do pagamento para sucesso
+    paymentStatusCtx, paymentCancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer paymentCancel()
+
+    _, statusErr := w.db.GetDB().ExecContext(paymentStatusCtx,
+        `INSERT INTO payment_results 
+         (request_id, checkout_id, status, transaction_id, customer_profile_id, payment_profile_id, subscription_id, created_at)
+         VALUES (?, ?, 'success', ?, ?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE
+         status = 'success',
+         transaction_id = ?,
+         customer_profile_id = ?,
+         payment_profile_id = ?,
+         subscription_id = ?,
+         created_at = NOW()`,
+        requestID, checkoutID, transactionID, customerProfileID, paymentProfileID, subscriptionID,
+        transactionID, customerProfileID, paymentProfileID, subscriptionID)
+
+    if statusErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
     }
-} else {
-    log.Printf("[RequestID: %s] Could not find master reference - Customer Profile IDs not saved", requestID)
-}
-
-// Atualizar status do pagamento para sucesso
-paymentStatusCtx, paymentCancel := context.WithTimeout(context.Background(), 15*time.Second)
-defer paymentCancel()
-
-_, statusErr := w.db.GetDB().ExecContext(paymentStatusCtx,
-    `INSERT INTO payment_results 
-     (request_id, checkout_id, status, transaction_id, customer_profile_id, payment_profile_id, created_at)
-     VALUES (?, ?, 'success', ?, ?, ?, NOW())
-     ON DUPLICATE KEY UPDATE
-     status = 'success',
-     transaction_id = ?,
-     customer_profile_id = ?,
-     payment_profile_id = ?,
-     created_at = NOW()`,
-    requestID, checkoutID, transactionID, customerProfileID, paymentProfileID,
-    transactionID, customerProfileID, paymentProfileID)
-
-if statusErr != nil {
-    log.Printf("[RequestID: %s] Warning: Failed to update payment status: %v", requestID, statusErr)
-}
     go func() {
         time.Sleep(6 * time.Hour) // Aguardar 6 horas antes de limpar
         cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1278,33 +1313,41 @@ func (w *Worker) processCreateSubscription(job *queue.Job) error {
 		}
 		
 		// Configurar a assinatura recorrente
-		err = w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
-		if err != nil {
-			return fmt.Errorf("failed to setup recurring billing: %v", err)
-		}
-		
-		// Atualizar o status da assinatura no banco de dados
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		
-		// Buscar o master_reference associado ao checkout
-		var masterRef string
-		err = w.db.GetDB().QueryRowContext(ctx, 
-			"SELECT master_reference FROM transactions WHERE checkout_id = ? LIMIT 1", 
-			checkoutID).Scan(&masterRef)
-		
-		if err != nil {
-			return fmt.Errorf("failed to get master reference: %v", err)
-		}
-		
-		// Atualizar a assinatura com o ID da assinatura da Authorize.net
-		_, err = w.db.GetDB().ExecContext(ctx, 
-			"UPDATE subscriptions SET status = 'active' WHERE master_reference = ?", 
-			masterRef)
-		
-		if err != nil {
-			return fmt.Errorf("failed to update subscription status: %v", err)
-		}
+		subscriptionID, err := w.paymentService.SetupRecurringBilling(paymentRequest, checkout)
+        if err != nil {
+            return fmt.Errorf("failed to setup recurring billing: %v", err)
+        }
+        
+        log.Printf("Successfully set up subscription with ID: %s for checkout %s", subscriptionID, checkoutID)
+        
+        // Atualizar o status da assinatura no banco de dados
+        ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        
+        // Buscar o master_reference associado ao checkout
+        var masterRef string
+        err = w.db.GetDB().QueryRowContext(ctx, 
+            "SELECT master_reference FROM transactions WHERE checkout_id = ? LIMIT 1", 
+            checkoutID).Scan(&masterRef)
+        
+        if err != nil {
+            return fmt.Errorf("failed to get master reference: %v", err)
+        }
+        
+        // CORRIGIDO: Atualizar a assinatura com o ID da assinatura da Authorize.net
+        _, err = w.db.GetDB().ExecContext(ctx, 
+            `UPDATE subscriptions 
+             SET status = 'active', 
+                 subscription_id = ?,
+                 updated_at = NOW()
+             WHERE master_reference = ?`, 
+            subscriptionID, masterRef)
+        
+        if err != nil {
+            return fmt.Errorf("failed to update subscription status: %v", err)
+        }
+        
+        log.Printf("Successfully updated subscription status to active with ID: %s for checkout %s", subscriptionID, checkoutID)
 		
 		log.Printf("Successfully set up subscription for checkout %s", checkoutID)
 		

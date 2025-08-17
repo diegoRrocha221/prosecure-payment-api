@@ -90,9 +90,10 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
         return nil, fmt.Errorf("failed to void initial transaction: %v", err)
     }
 
-    // Configurar cobrança recorrente (AGORA COM CUSTOMER PROFILE)
+    // CORRIGIDO: Configurar cobrança recorrente (AGORA COM CUSTOMER PROFILE)
     log.Printf("Setting up recurring billing with customer profile for checkout ID: %s", payment.CheckoutID)
-    if err := s.SetupRecurringBilling(payment, checkout); err != nil {
+    subscriptionID, err := s.SetupRecurringBilling(payment, checkout)
+    if err != nil {
         log.Printf("Error setting up recurring billing: %v", err)
         // Tentar anular a transação novamente para garantir que não esteja pendente
         if voidErr := s.client.VoidTransaction(resp.TransactionID); voidErr != nil {
@@ -101,6 +102,7 @@ func (s *Service) ProcessPayment(payment *models.PaymentRequest, checkout *model
         return nil, fmt.Errorf("failed to setup recurring billing: %v", err)
     }
 
+    log.Printf("Successfully created subscription with ID: %s for checkout: %s", subscriptionID, payment.CheckoutID)
     return resp, nil
 }
 
@@ -164,9 +166,9 @@ func (s *Service) ValidateCard(payment *models.PaymentRequest) bool {
 }
 
 // SetupRecurringBilling configura cobrança recorrente USANDO CUSTOMER PROFILE
-func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout *models.CheckoutData) error {
+func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout *models.CheckoutData) (string, error) {
     if !s.ValidateCard(payment) {
-        return errors.New("invalid card data for recurring billing setup")
+        return "", errors.New("invalid card data for recurring billing setup")
     }
 
     startTime := time.Now()
@@ -180,21 +182,21 @@ func (s *Service) SetupRecurringBilling(payment *models.PaymentRequest, checkout
     // NOVO: Usar o método que cria customer profile + subscription
     subscriptionResp, err := s.client.CreateSubscription(payment, checkout)
     if err != nil {
-        return fmt.Errorf("failed to setup recurring billing with customer profile: %v", err)
+        return "", fmt.Errorf("failed to setup recurring billing with customer profile: %v", err)
     }
 
     if !subscriptionResp.Success {
-        return fmt.Errorf("subscription creation failed: %s", subscriptionResp.Message)
+        return "", fmt.Errorf("subscription creation failed: %s", subscriptionResp.Message)
     }
 
     log.Printf("Successfully created subscription with customer profile - Subscription ID: %s", subscriptionResp.SubscriptionID)
-    return nil
+    return subscriptionResp.SubscriptionID, nil // CORRIGIDO: Retorna o subscription ID
 }
 
 // SetupRecurringBillingDirect configura cobrança recorrente SEM CUSTOMER PROFILE (método legado)
-func (s *Service) SetupRecurringBillingDirect(payment *models.PaymentRequest, checkout *models.CheckoutData) error {
+func (s *Service) SetupRecurringBillingDirect(payment *models.PaymentRequest, checkout *models.CheckoutData) (string, error) {
     if !s.ValidateCard(payment) {
-        return errors.New("invalid card data for recurring billing setup")
+        return "", errors.New("invalid card data for recurring billing setup")
     }
 
     startTime := time.Now()
@@ -208,15 +210,15 @@ func (s *Service) SetupRecurringBillingDirect(payment *models.PaymentRequest, ch
     // Usar o método legado que usa dados de cartão diretos
     subscriptionResp, err := s.client.CreateSubscriptionDirect(payment, checkout)
     if err != nil {
-        return fmt.Errorf("failed to setup recurring billing (direct method): %v", err)
+        return "", fmt.Errorf("failed to setup recurring billing (direct method): %v", err)
     }
 
     if !subscriptionResp.Success {
-        return fmt.Errorf("subscription creation failed (direct method): %s", subscriptionResp.Message)
+        return "", fmt.Errorf("subscription creation failed (direct method): %s", subscriptionResp.Message)
     }
 
     log.Printf("Successfully created subscription (direct method) with ID: %s", subscriptionResp.SubscriptionID)
-    return nil
+    return subscriptionResp.SubscriptionID, nil // CORRIGIDO: Retorna o subscription ID
 }
 
 // CreateCustomerProfile cria um customer profile na Authorize.net
