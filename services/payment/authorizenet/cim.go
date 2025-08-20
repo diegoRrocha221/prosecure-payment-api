@@ -339,33 +339,17 @@ func (c *Client) UpdateCustomerPaymentProfile(customerProfileID, paymentProfileI
         log.Printf("UpdateCustomerPaymentProfile completed in %v", time.Since(startTime))
     }()
 
-    // Extrair nome e sobrenome
-    names := strings.Fields(checkout.Name)
-    firstName := names[0]
-    lastName := ""
-    if len(names) > 1 {
-        lastName = strings.Join(names[1:], " ")
-    }
-
-    // Criar o perfil de pagamento atualizado
-    paymentProfile := CustomerPaymentProfileType{
-        CustomerType: "individual",
-        BillTo: &CustomerAddressType{
-            FirstName: firstName,
-            LastName:  lastName,
-            Address:   checkout.Street,
-            City:     checkout.City,
-            State:    checkout.State,
-            Zip:      checkout.ZipCode,
-            Country:  "US",
-        },
-        Payment: &PaymentType{
+    // CORRIGIDO: Estrutura MÍNIMA - apenas payment profile ID + payment
+    paymentProfile := UpdateCustomerPaymentProfileType{
+        CustomerPaymentProfileID: paymentProfileID, // OBRIGATÓRIO
+        Payment: &PaymentType{                       // APENAS o novo método de pagamento
             CreditCard: CreditCardType{
                 CardNumber:     payment.CardNumber,
                 ExpirationDate: payment.Expiry,
                 CardCode:       payment.CVV,
             },
         },
+        // NÃO incluir billTo, customerType, etc.
     }
 
     // Construir a requisição
@@ -427,4 +411,104 @@ func (c *Client) UpdateCustomerPaymentProfile(customerProfileID, paymentProfileI
 
     log.Printf("Customer payment profile updated successfully: %s/%s", customerProfileID, paymentProfileID)
     return nil
+}
+
+func (c *Client) CreateCustomerPaymentProfile(customerProfileID string, paymentReq *models.PaymentRequest, checkoutData *models.CheckoutData) (string, error) {
+    log.Printf("Creating customer payment profile for customer: %s", customerProfileID)
+    
+    startTime := time.Now()
+    defer func() {
+        log.Printf("CreateCustomerPaymentProfile completed in %v", time.Since(startTime))
+    }()
+
+    // Extrair nome e sobrenome
+    names := strings.Fields(checkoutData.Name)
+    firstName := names[0]
+    lastName := ""
+    if len(names) > 1 {
+        lastName = strings.Join(names[1:], " ")
+    }
+
+    // Create payment profile request
+    paymentProfile := &CustomerPaymentProfileType{
+        CustomerType: "individual",
+        BillTo: &CustomerAddressType{
+            FirstName: firstName,
+            LastName:  lastName,
+            Address:   checkoutData.Street,
+            City:      checkoutData.City,
+            State:     checkoutData.State,
+            Zip:       checkoutData.ZipCode,
+            Country:   "US",
+        },
+        Payment: &PaymentType{
+            CreditCard: CreditCardType{
+                CardNumber:     paymentReq.CardNumber,
+                ExpirationDate: paymentReq.Expiry,
+                CardCode:       paymentReq.CVV,
+            },
+        },
+    }
+
+    // Create the request
+    request := CreateCustomerPaymentProfileRequestWrapper{
+        CreateCustomerPaymentProfileRequest: CreateCustomerPaymentProfileRequest{
+            MerchantAuthentication: c.getMerchantAuthentication(),
+            CustomerProfileId:      customerProfileID,
+            PaymentProfile:         paymentProfile,
+            ValidationMode:         "testMode",
+        },
+    }
+
+    // Convert to JSON
+    jsonData, err := json.Marshal(request)
+    if err != nil {
+        return "", fmt.Errorf("failed to marshal create payment profile request: %v", err)
+    }
+
+    // Make API call
+    ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+    defer cancel()
+    
+    httpReq, err := http.NewRequestWithContext(ctx, "POST", c.getEndpoint(), bytes.NewBuffer(jsonData))
+    if err != nil {
+        return "", fmt.Errorf("failed to create HTTP request: %v", err)
+    }
+
+    httpReq.Header.Set("Content-Type", "application/json")
+
+    c.mutex.Lock()
+    resp, err := c.client.Do(httpReq)
+    c.mutex.Unlock()
+    
+    if err != nil {
+        return "", fmt.Errorf("failed to make API call: %v", err)
+    }
+    defer resp.Body.Close()
+
+    // Read response
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return "", fmt.Errorf("failed to read response: %v", err)
+    }
+
+    cleanBody := strings.TrimPrefix(string(body), "\ufeff")
+
+    // Parse response
+    var response CreateCustomerPaymentProfileResponse
+    if err := json.Unmarshal([]byte(cleanBody), &response); err != nil {
+        return "", fmt.Errorf("failed to unmarshal response: %v", err)
+    }
+
+    // Check for errors
+    if response.Messages.ResultCode != "Ok" {
+        errorMsg := "Unknown error"
+        if len(response.Messages.Message) > 0 {
+            errorMsg = response.Messages.Message[0].Text
+        }
+        return "", fmt.Errorf("create payment profile failed: %s", errorMsg)
+    }
+
+    log.Printf("Successfully created payment profile: %s for customer: %s", response.CustomerPaymentProfileId, customerProfileID)
+    return response.CustomerPaymentProfileId, nil
 }

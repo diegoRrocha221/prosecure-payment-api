@@ -335,6 +335,29 @@ func validateLuhn(cardNumber string) bool {
     return sum%10 == 0
 }
 
+func (s *Service) CreateCustomerPaymentProfile(customerProfileID string, paymentReq *models.PaymentRequest, checkoutData *models.CheckoutData) (string, error) {
+    if !s.ValidateCard(paymentReq) {
+        return "", errors.New("invalid card data for payment profile creation")
+    }
+
+    log.Printf("Creating new customer payment profile for customer: %s", customerProfileID)
+    
+    startTime := time.Now()
+    defer func() {
+        log.Printf("Customer payment profile creation took %v for customer: %s", 
+            time.Since(startTime), customerProfileID)
+    }()
+    
+    paymentProfileID, err := s.client.CreateCustomerPaymentProfile(customerProfileID, paymentReq, checkoutData)
+    if err != nil {
+        log.Printf("Failed to create customer payment profile for %s: %v", customerProfileID, err)
+        return "", fmt.Errorf("failed to create customer payment profile: %v", err)
+    }
+    
+    log.Printf("Successfully created payment profile %s for customer %s", paymentProfileID, customerProfileID)
+    return paymentProfileID, nil
+}
+
 // Função helper para validar data de expiração
 func validateExpiry(expiry string) bool {
     currentTime := time.Now()

@@ -161,7 +161,8 @@ type CustomerProfileType struct {
 }
 
 type CustomerPaymentProfileType struct {
-    CustomerType            string                `json:"customerType,omitempty"`
+    CustomerPaymentProfileID string                `json:"customerPaymentProfileId,omitempty"` // Para GET responses
+    CustomerType            string                `json:"customerType,omitempty"`              // SÓ para CREATE
     BillTo                  *CustomerAddressType  `json:"billTo,omitempty"`
     Payment                 *PaymentType          `json:"payment,omitempty"`
     DefaultPaymentProfile   bool                  `json:"defaultPaymentProfile,omitempty"`
@@ -211,11 +212,17 @@ type GetCustomerProfileResponse struct {
     Profile  CustomerProfileType `json:"profile,omitempty"`
 }
 
+// CORRIGIDO: Usar apenas uma declaração do UpdateCustomerPaymentProfileRequest
 type UpdateCustomerPaymentProfileRequest struct {
-    MerchantAuthentication merchantAuthenticationType  `json:"merchantAuthentication"`
-    CustomerProfileID     string                     `json:"customerProfileId"`
-    PaymentProfile        CustomerPaymentProfileType `json:"paymentProfile"`
-    ValidationMode        string                     `json:"validationMode,omitempty"`
+    MerchantAuthentication merchantAuthenticationType          `json:"merchantAuthentication"`
+    CustomerProfileID     string                             `json:"customerProfileId"`
+    PaymentProfile        UpdateCustomerPaymentProfileType   `json:"paymentProfile"` // Tipo específico para update
+    ValidationMode        string                             `json:"validationMode,omitempty"`
+}
+
+type UpdateCustomerPaymentProfileType struct {
+    CustomerPaymentProfileID string       `json:"customerPaymentProfileId"` // OBRIGATÓRIO
+    Payment                 *PaymentType `json:"payment"`                  // OBRIGATÓRIO
 }
 
 type UpdateCustomerPaymentProfileRequestWrapper struct {
@@ -248,4 +255,23 @@ type ARBUpdateSubscriptionRequest struct {
 
 type ARBUpdateSubscriptionType struct {
     Amount string `json:"amount,omitempty"`
+}
+
+// Types for creating new payment profiles
+type CreateCustomerPaymentProfileRequest struct {
+    MerchantAuthentication merchantAuthenticationType `json:"merchantAuthentication"`
+    CustomerProfileId      string                     `json:"customerProfileId"`
+    PaymentProfile         *CustomerPaymentProfileType `json:"paymentProfile"`
+    ValidationMode         string                     `json:"validationMode,omitempty"`
+}
+
+type CreateCustomerPaymentProfileRequestWrapper struct {
+    CreateCustomerPaymentProfileRequest CreateCustomerPaymentProfileRequest `json:"createCustomerPaymentProfileRequest"`
+}
+
+// CreateCustomerPaymentProfileResponse represents the response from creating a customer payment profile
+type CreateCustomerPaymentProfileResponse struct {
+    CustomerPaymentProfileId     string           `json:"customerPaymentProfileId"`
+    ValidationDirectResponse     string           `json:"validationDirectResponse,omitempty"`
+    Messages                     MessagesType     `json:"messages"`
 }

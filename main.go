@@ -283,6 +283,9 @@ func main() {
     addPlansHandler := handlers.NewAddPlansHandler(db, paymentService, emailService)
     addPlansProtectedPaymentHandler := handlers.NewAddPlansProtectedPaymentHandler(db)
     
+    dashboardUpdateCardHandler := handlers.NewDashboardUpdateCardHandler(db, paymentService, emailService)
+    protectedRouter.HandleFunc("/dashboard/update-card", dashboardUpdateCardHandler.UpdateCard).Methods("POST", "OPTIONS")
+
     protectedRouter.HandleFunc("/add-plans", addPlansHandler.AddPlans).Methods("POST", "OPTIONS")
     protectedRouter.HandleFunc("/preview-add-plans", addPlansHandler.PreviewAddPlans).Methods("POST", "OPTIONS")
     protectedRouter.HandleFunc("/card-info", addPlansProtectedPaymentHandler.GetCardInfo).Methods("GET", "OPTIONS") // NOVA ROTA
