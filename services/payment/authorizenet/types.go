@@ -221,8 +221,9 @@ type UpdateCustomerPaymentProfileRequest struct {
 }
 
 type UpdateCustomerPaymentProfileType struct {
-    CustomerPaymentProfileID string       `json:"customerPaymentProfileId"` // OBRIGATÓRIO
-    Payment                 *PaymentType `json:"payment"`                  // OBRIGATÓRIO
+    BillTo                  *CustomerAddressType `json:"billTo,omitempty"`         // PRIMEIRO
+    Payment                 *PaymentType         `json:"payment"`                  // SEGUNDO  
+    CustomerPaymentProfileID string               `json:"customerPaymentProfileId"` // POR ÚLTIMO!
 }
 
 type UpdateCustomerPaymentProfileRequestWrapper struct {

@@ -158,12 +158,12 @@ func (h *DashboardUpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.R
     }
 
     // Atualizar billing_infos no banco
-    maskedCard, err := h.updateBillingInfo(masterAccount.ReferenceUUID, req.CardNumber, req.Expiry)
-    if err != nil {
-        log.Printf("Error updating billing info: %v", err)
-        utils.SendErrorResponse(w, http.StatusInternalServerError, "Failed to update billing information")
-        return
-    }
+		maskedCard, err := h.updateBillingInfo(masterAccount.ReferenceUUID, req.CardNumber, req.Expiry, req.CardName)
+		if err != nil {
+				log.Printf("Error updating billing info: %v", err)
+				utils.SendErrorResponse(w, http.StatusInternalServerError, "Failed to update billing information")
+				return
+		}
 
     // Se o usuário tinha erro de pagamento, reativar a conta
     if user.AccountType == "payment_error" {
@@ -221,21 +221,21 @@ func (h *DashboardUpdateCardHandler) getMasterAccountData(username, email string
     return &account, err
 }
 
-func (h *DashboardUpdateCardHandler) updateBillingInfo(masterRef, cardNumber, expiry string) (string, error) {
-    // Mascarar cartão
-    maskedCard := "XXXX XXXX XXXX " + cardNumber[len(cardNumber)-4:]
-    
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-    
-    query := `
-        UPDATE billing_infos 
-        SET card = ?, expiry = ?, updated_at = NOW()
-        WHERE master_reference = ?
-    `
-    
-    _, err := h.db.GetDB().ExecContext(ctx, query, maskedCard, expiry, masterRef)
-    return maskedCard, err
+func (h *DashboardUpdateCardHandler) updateBillingInfo(masterRef, cardNumber, expiry, holderName string) (string, error) {
+	// Mascarar cartão
+	maskedCard := "XXXX XXXX XXXX " + cardNumber[len(cardNumber)-4:]
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	query := `
+			UPDATE billing_infos 
+			SET card = ?, expiry = ?, holder_name = ?, updated_at = NOW()
+			WHERE master_reference = ?
+	`
+	
+	_, err := h.db.GetDB().ExecContext(ctx, query, maskedCard, expiry, holderName, masterRef)
+	return maskedCard, err
 }
 
 func (h *DashboardUpdateCardHandler) updateCustomerPaymentProfileID(masterRef, newPaymentProfileID string) error {

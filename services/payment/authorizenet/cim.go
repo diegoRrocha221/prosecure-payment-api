@@ -333,23 +333,41 @@ func (c *Client) getFirstPaymentProfileID(customerProfileID string) (string, err
 }
 
 // UpdateCustomerPaymentProfile atualiza o método de pagamento de um customer profile existente
+// UpdateCustomerPaymentProfile atualiza o método de pagamento de um customer profile existente
+// UpdateCustomerPaymentProfile atualiza o método de pagamento de um customer profile existente
 func (c *Client) UpdateCustomerPaymentProfile(customerProfileID, paymentProfileID string, payment *models.PaymentRequest, checkout *models.CheckoutData) error {
     startTime := time.Now()
     defer func() {
         log.Printf("UpdateCustomerPaymentProfile completed in %v", time.Since(startTime))
     }()
 
-    // CORRIGIDO: Estrutura MÍNIMA - apenas payment profile ID + payment
+    // Extrair nome e sobrenome
+    names := strings.Fields(checkout.Name)
+    firstName := names[0]
+    lastName := ""
+    if len(names) > 1 {
+        lastName = strings.Join(names[1:], " ")
+    }
+
+    // CRÍTICO: ORDEM DOS CAMPOS IMPORTA! customerPaymentProfileId deve vir POR ÚLTIMO
     paymentProfile := UpdateCustomerPaymentProfileType{
-        CustomerPaymentProfileID: paymentProfileID, // OBRIGATÓRIO
-        Payment: &PaymentType{                       // APENAS o novo método de pagamento
+        BillTo: &CustomerAddressType{
+            FirstName: firstName,
+            LastName:  lastName,
+            Address:   checkout.Street,
+            City:      checkout.City,
+            State:     checkout.State,
+            Zip:       checkout.ZipCode,
+            Country:   "US",
+        },
+        Payment: &PaymentType{
             CreditCard: CreditCardType{
                 CardNumber:     payment.CardNumber,
                 ExpirationDate: payment.Expiry,
                 CardCode:       payment.CVV,
             },
         },
-        // NÃO incluir billTo, customerType, etc.
+        CustomerPaymentProfileID: paymentProfileID, // DEVE VIR POR ÚLTIMO!
     }
 
     // Construir a requisição
