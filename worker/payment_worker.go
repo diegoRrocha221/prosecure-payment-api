@@ -542,6 +542,17 @@ func (w *Worker) processDelayedPaymentJob(job *queue.Job) error {
         log.Printf("[RequestID: %s] Invoice email sent successfully to %s", requestID, checkout.Email)
     }
     
+    // NOVO: ETAPA 7: Marcar payment_status = 3 (processamento bem-sucedido)
+    log.Printf("[RequestID: %s] Step 7: Setting payment status to success (3)", requestID)
+    
+    successErr := w.db.SetPaymentProcessingSuccess(checkout.Email, checkout.Username)
+    if successErr != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to set payment status to success: %v", requestID, successErr)
+        // Não falha o processo por causa disso - pagamento já foi processado com sucesso
+    } else {
+        log.Printf("[RequestID: %s] Successfully set payment status to success (3) for user: %s", requestID, checkout.Username)
+    }
+    
     log.Printf("[RequestID: %s] Delayed payment processing with Customer Profile completed successfully", requestID)
     return nil
 }
@@ -587,14 +598,18 @@ func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, 
         log.Printf("[RequestID: %s] Warning: Failed to update payment failure status: %v", requestID, dbErr)
     }
     
-    // Marcar usuário como inativo (is_active = 9) se existir
-    markErr := w.db.MarkUserInactive(checkout.Email, checkout.Username)
-    if markErr != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to mark user inactive: %v", requestID, markErr)
-    }
-    
-    // Enviar email de notificação de falha APENAS se solicitado
+    // CORRIGIDO: Só marcar payment_status = 1 (failed) se for a ÚLTIMA tentativa
     if sendEmail {
+        // É a última tentativa, marcar como definitivamente falhou
+        log.Printf("[RequestID: %s] FINAL ATTEMPT - Setting payment status to failed (1) for user: %s", requestID, checkout.Username)
+        markErr := w.db.SetPaymentProcessingFailed(checkout.Email, checkout.Username)
+        if markErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to set payment status to failed: %v", requestID, markErr)
+        } else {
+            log.Printf("[RequestID: %s] Successfully set payment status to failed (1) for user: %s", requestID, checkout.Username)
+        }
+        
+        // Enviar email de notificação de falha final
         log.Printf("[RequestID: %s] Sending failure notification email (final attempt)", requestID)
         failureEmailContent := w.generatePaymentFailureEmail(checkout.Name, errorMsg)
         
@@ -606,27 +621,33 @@ func (w *Worker) handlePaymentFailure(checkout *models.CheckoutData, requestID, 
         
         if emailErr != nil {
             log.Printf("[RequestID: %s] Warning: Failed to send failure email: %v", requestID, emailErr)
-            // Não retorna erro pois o importante é registrar a falha
         } else {
             log.Printf("[RequestID: %s] Payment failure email sent to %s", requestID, checkout.Email)
         }
+        
+        // Limpar dados de cartão temporários apenas na última tentativa
+        _, cleanupErr := w.db.GetDB().ExecContext(ctx,
+            "DELETE FROM temp_payment_data WHERE checkout_id = ?",
+            checkout.ID)
+        
+        if cleanupErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
+        }
     } else {
-        log.Printf("[RequestID: %s] Skipping failure email (not final attempt, retry %d will follow)", requestID, requestID)
-    }
-    
-    // Limpar dados de cartão temporários
-    _, cleanupErr := w.db.GetDB().ExecContext(ctx,
-        "DELETE FROM temp_payment_data WHERE checkout_id = ?",
-        checkout.ID)
-    
-    if cleanupErr != nil {
-        log.Printf("[RequestID: %s] Warning: Failed to clean up temporary payment data: %v", requestID, cleanupErr)
+        // NÃO é a última tentativa, manter payment_status = 0 (processing)
+        log.Printf("[RequestID: %s] Retry attempt - keeping payment status as processing (0) for user: %s", requestID, checkout.Username)
+        log.Printf("[RequestID: %s] Skipping failure email (not final attempt, retry will follow)", requestID)
+        
+        // OPCIONAL: Garantir que está como 0 (caso tenha sido alterado incorretamente)
+        ensureErr := w.db.SetPaymentProcessingStarted(checkout.Email, checkout.Username)
+        if ensureErr != nil {
+            log.Printf("[RequestID: %s] Warning: Failed to ensure payment status is processing: %v", requestID, ensureErr)
+        }
     }
     
     // Retorna o erro original para que seja registrado no job
     return fmt.Errorf("payment processing failed: %s", errorMsg)
 }
-
 // generatePaymentFailureEmail - Gera email de falha de pagamento
 func (w *Worker) generatePaymentFailureEmail(customerName, errorMessage string) string {
     footer := "If you need assistance, please don't hesitate to contact our support team. We're here to help you get your ProSecureLSP account set up successfully."

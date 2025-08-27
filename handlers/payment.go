@@ -72,6 +72,7 @@ func sendSuccessResponse(w http.ResponseWriter, response models.APIResponse) {
     json.NewEncoder(w).Encode(response)
 }
 
+
 func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) {
     requestID := uuid.New().String()
     log.Printf("[RequestID: %s] Starting payment processing", requestID)
@@ -205,11 +206,19 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
         return
     }
     
+    // NOVO: Definir payment_status = 0 (processamento iniciado) para o usuário criado
+    log.Printf("[RequestID: %s] Setting initial payment status to processing (0)", requestID)
+    err = h.db.SetPaymentProcessingStarted(checkout.Email, checkout.Username)
+    if err != nil {
+        log.Printf("[RequestID: %s] Warning: Failed to set initial payment status: %v", requestID, err)
+        // Não falha o processo por causa disso
+    }
+    
     log.Printf("[RequestID: %s] Account created successfully, scheduling payment processing", requestID)
 
     // AGENDAR: Processamento de pagamento (transação teste + void + ARB)
     // TODO: ALTERAR PARA 1 HORA EM PRODUÇÃO (time.Hour)
-    paymentDelay := 2 * time.Minute // TESTE: 2 minutos | PRODUÇÃO: time.Hour
+    paymentDelay := 40 * time.Second // TESTE: 2 minutos | PRODUÇÃO: time.Hour
     
     ctx := context.Background()
     err = h.queue.EnqueueDelayed(ctx, queue.JobTypeDelayedPayment, map[string]interface{}{
@@ -219,6 +228,8 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     
     if err != nil {
         log.Printf("[RequestID: %s] Error enqueueing delayed payment job: %v", requestID, err)
+        // Se falhar ao agendar, marcar como erro no payment_status
+        h.db.SetPaymentProcessingFailed(checkout.Email, checkout.Username)
         sendErrorResponse(w, http.StatusInternalServerError, "Falha ao agendar processamento de pagamento")
         return
     }

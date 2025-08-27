@@ -269,38 +269,75 @@ func (c *Connection) UpdateUserActivationCode(email, username, code string) erro
     return nil
 }
 
-// MarkUserInactive marca um usuário como inativo (is_active = 9) para falhas de pagamento
+func (c *Connection) SetUserPaymentStatus(email, username string, status int) error {
+	if err := c.ensureConnection(); err != nil {
+			return fmt.Errorf("database connection check failed: %v", err)
+	}
+
+	log.Printf("Setting payment status %d for user: %s", status, username)
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	query := `UPDATE users SET payment_status = ? WHERE username = ? AND email = ?`
+ 
+	result, err := c.db.ExecContext(ctx, query, status, username, email)
+	if err != nil {
+			log.Printf("Error setting payment status: %v", err)
+			return fmt.Errorf("error setting payment status: %v", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+			return fmt.Errorf("error getting rows affected: %v", err)
+	}
+
+	if rowsAffected == 0 {
+			log.Printf("Warning: No user found with username %s and email %s to update payment status", username, email)
+			return nil
+	}
+
+	log.Printf("Successfully set payment status %d for user: %s", status, username)
+	return nil
+}
+
+func (c *Connection) GetUserPaymentStatus(email, username string) (int, error) {
+	if err := c.ensureConnection(); err != nil {
+			return -1, fmt.Errorf("database connection check failed: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var paymentStatus int
+	query := `SELECT COALESCE(payment_status, 0) FROM users WHERE username = ? AND email = ?`
+	
+	err := c.db.QueryRowContext(ctx, query, username, email).Scan(&paymentStatus)
+	if err != nil {
+			if err == sql.ErrNoRows {
+					return 0, fmt.Errorf("no user found with username %s and email %s", username, email)
+			}
+			return -1, fmt.Errorf("error getting payment status: %v", err)
+	}
+
+	return paymentStatus, nil
+}
+
+func (c *Connection) SetPaymentProcessingStarted(email, username string) error {
+	return c.SetUserPaymentStatus(email, username, 0) // 0 = processamento iniciado
+}
+
+func (c *Connection) SetPaymentProcessingFailed(email, username string) error {
+	return c.SetUserPaymentStatus(email, username, 1) // 1 = erro no processamento
+}
+
+func (c *Connection) SetPaymentProcessingSuccess(email, username string) error {
+	return c.SetUserPaymentStatus(email, username, 3) // 3 = processamento bem-sucedido
+}
+
 func (c *Connection) MarkUserInactive(email, username string) error {
-    if err := c.ensureConnection(); err != nil {
-        return fmt.Errorf("database connection check failed: %v", err)
-    }
-
-    log.Printf("Marking user inactive due to payment failure: %s", username)
-    
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
-
-    query := `UPDATE users SET is_active = 9 WHERE username = ? AND email = ?`
-   
-    result, err := c.db.ExecContext(ctx, query, username, email)
-    if err != nil {
-        log.Printf("Error marking user inactive: %v", err)
-        return fmt.Errorf("error marking user inactive: %v", err)
-    }
-
-    rowsAffected, err := result.RowsAffected()
-    if err != nil {
-        return fmt.Errorf("error getting rows affected: %v", err)
-    }
-
-    if rowsAffected == 0 {
-        log.Printf("Warning: No user found with username %s and email %s to mark inactive", username, email)
-        // Não retorna erro pois pode não existir ainda se o pagamento falhou antes da criação
-        return nil
-    }
-
-    log.Printf("Successfully marked user inactive: %s", username)
-    return nil
+	log.Printf("MarkUserInactive called for %s - using SetUserPaymentStatus instead", username)
+	return c.SetUserPaymentStatus(email, username, 1) // 1 = erro de pagamento
 }
 
 func (c *Connection) IsCheckoutProcessed(checkoutID string) (bool, error) {
