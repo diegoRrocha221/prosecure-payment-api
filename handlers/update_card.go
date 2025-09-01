@@ -1,4 +1,4 @@
-// handlers/update_card.go - CORRIGIDO COM CUSTOMER PROFILE
+// handlers/update_card.go - CORRIGIDO SEM ERROS DE COMPILAÇÃO
 package handlers
 
 import (
@@ -50,10 +50,11 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
     requestID := fmt.Sprintf("update-%d", time.Now().UnixNano())
     log.Printf("[UpdateCard %s] Starting ENHANCED card update process with Customer Profile", requestID)
     
-    // CRÍTICO: Definir timeout de resposta otimizado
-    ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second) // 45 segundos MAX
+    // TIMEOUT QUASE ILIMITADO: 10 MINUTOS
+    ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute) // 600 segundos
     defer cancel()
     
+    // Rest of the function remains the same...
     // Canal para resultado do processamento
     resultChan := make(chan UpdateCardResponse, 1)
     errorChan := make(chan error, 1)
@@ -91,7 +92,7 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
 
     log.Printf("[UpdateCard %s] Basic validation passed, starting async processing with Customer Profile", requestID)
     
-    // NOVO: Processar de forma assíncrona com Customer Profile
+    // Processar de forma assíncrona com Customer Profile
     go func() {
         defer func() {
             if r := recover(); r != nil {
@@ -120,7 +121,7 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
         }
     }()
 
-    // Aguardar resultado com timeout RÍGIDO
+    // Aguardar resultado com timeout QUASE ILIMITADO
     select {
     case result := <-resultChan:
         log.Printf("[UpdateCard %s] Async processing completed successfully", requestID)
@@ -143,17 +144,17 @@ func (h *UpdateCardHandler) UpdateCard(w http.ResponseWriter, r *http.Request) {
         h.sendErrorResponse(w, http.StatusInternalServerError, err.Error())
         
     case <-ctx.Done():
-        log.Printf("[UpdateCard %s] Request timeout after 45 seconds", requestID)
+        log.Printf("[UpdateCard %s] Request timeout after 10 minutes", requestID)
         h.sendErrorResponse(w, http.StatusRequestTimeout, "Request timeout - please try again")
     }
 }
 
-// NOVA FUNÇÃO: Processamento com Customer Profile (seguindo padrão do worker)
+// PROCESSAMENTO COM TIMEOUTS MAIORES
 func (h *UpdateCardHandler) processCardUpdateWithCustomerProfile(ctx context.Context, requestID string, req UpdateCardRequest) (UpdateCardResponse, error) {
     log.Printf("[UpdateCard %s] Enhanced processing started with Customer Profile integration", requestID)
     
-    // ETAPA 1: Buscar dados da conta (COM TIMEOUT)
-    dbCtx, dbCancel := context.WithTimeout(ctx, 5*time.Second)
+    // ETAPA 1: Buscar dados da conta (TIMEOUT AUMENTADO)
+    dbCtx, dbCancel := context.WithTimeout(ctx, 20*time.Second) // Aumentado
     defer dbCancel()
     
     masterAccount, err := h.getMasterAccountDataFast(dbCtx, req.Email, req.Username)
@@ -161,16 +162,16 @@ func (h *UpdateCardHandler) processCardUpdateWithCustomerProfile(ctx context.Con
         return UpdateCardResponse{}, fmt.Errorf("account not found or invalid credentials: %v", err)
     }
 
-    // ETAPA 2: Verificar status inativo (COM TIMEOUT)
-    isInactive, err := h.checkUserInactiveStatusFast(dbCtx, req.Email, req.Username)
+    // ETAPA 2: Verificar status de pagamento
+    hasPaymentError, err := h.checkUserPaymentErrorStatusFast(dbCtx, req.Email, req.Username)
     if err != nil {
-        return UpdateCardResponse{}, fmt.Errorf("error checking account status: %v", err)
+        return UpdateCardResponse{}, fmt.Errorf("error checking account payment status: %v", err)
     }
 
-    if !isInactive {
+    if !hasPaymentError {
         return UpdateCardResponse{
             Status:  "error",
-            Message: "Account is already active, no card update needed",
+            Message: "Account payment status is normal, no card update needed",
             Success: false,
         }, nil
     }
@@ -206,8 +207,8 @@ func (h *UpdateCardHandler) processCardUpdateWithCustomerProfile(ctx context.Con
         }, nil
     }
 
-    // ETAPA 5: Processar pagamento com Customer Profile (timeout reduzido)
-    paymentCtx, paymentCancel := context.WithTimeout(ctx, 30*time.Second) // 30 segundos para pagamento
+    // ETAPA 5: Processar pagamento com Customer Profile (TIMEOUT MUITO GRANDE)
+    paymentCtx, paymentCancel := context.WithTimeout(ctx, 8*time.Minute) // 8 MINUTOS
     defer paymentCancel()
     
     transactionID, customerProfileID, paymentProfileID, err := h.processPaymentWithCustomerProfile(paymentCtx, requestID, paymentReq, masterAccount)
@@ -216,7 +217,7 @@ func (h *UpdateCardHandler) processCardUpdateWithCustomerProfile(ctx context.Con
     }
 
     // ETAPA 6: Atualizar banco rapidamente
-    updateCtx, updateCancel := context.WithTimeout(ctx, 10*time.Second)
+    updateCtx, updateCancel := context.WithTimeout(ctx, 30*time.Second) // Aumentado
     defer updateCancel()
     
     if err := h.updateAccountAfterCardUpdateWithProfile(updateCtx, masterAccount, paymentReq, transactionID, customerProfileID, paymentProfileID); err != nil {
@@ -240,7 +241,7 @@ func (h *UpdateCardHandler) processCardUpdateWithCustomerProfile(ctx context.Con
     }, nil
 }
 
-// NOVA FUNÇÃO: Processamento de pagamento com Customer Profile (seguindo padrão do worker)
+// NOVA FUNÇÃO: Processamento de pagamento com Customer Profile
 func (h *UpdateCardHandler) processPaymentWithCustomerProfile(ctx context.Context, requestID string, paymentReq *models.PaymentRequest, master *models.MasterAccount) (string, string, string, error) {
     log.Printf("[UpdateCard %s] Enhanced payment operations started with Customer Profile", requestID)
     
@@ -272,7 +273,7 @@ func (h *UpdateCardHandler) processPaymentWithCustomerProfile(ctx context.Contex
         log.Printf("[UpdateCard %s] Test transaction voided successfully", requestID)
     }
     
-    // NOVA ETAPA 3: Criar ou Atualizar Customer Profile (SEGUINDO PADRÃO DO WORKER)
+    // NOVA ETAPA 3: Criar ou Atualizar Customer Profile
     log.Printf("[UpdateCard %s] Step 3: Creating/Updating Customer Profile in Authorize.net", requestID)
     
     checkoutData := h.convertMasterAccountToCheckoutData(master)
@@ -284,7 +285,7 @@ func (h *UpdateCardHandler) processPaymentWithCustomerProfile(ctx context.Contex
     log.Printf("[UpdateCard %s] Customer Profile handled successfully - Profile ID: %s, Payment Profile ID: %s", 
         requestID, customerProfileID, paymentProfileID)
     
-    // NOVA ETAPA 4: Criar ARB usando Customer Profile (COMO NO WORKER)
+    // NOVA ETAPA 4: Criar ARB usando Customer Profile
     log.Printf("[UpdateCard %s] Step 4: Creating subscription (ARB) using Customer Profile", requestID)
     
     subscriptionID, err := h.paymentService.SetupRecurringBilling(paymentReq, checkoutData)
@@ -385,7 +386,7 @@ func (h *UpdateCardHandler) handleCustomerProfile(ctx context.Context, requestID
     return customerProfileID, paymentProfileID, nil
 }
 
-// ATUALIZADA: Função de atualização de banco com Customer Profile
+// FUNÇÃO: Atualização de banco com Customer Profile
 func (h *UpdateCardHandler) updateAccountAfterCardUpdateWithProfile(ctx context.Context, master *models.MasterAccount, payment *models.PaymentRequest, transactionID, customerProfileID, paymentProfileID string) error {
     tx, err := h.db.BeginTransaction()
     if err != nil {
@@ -419,13 +420,11 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateWithProfile(ctx context.
         return fmt.Errorf("failed to update payment method: %v", err)
     }
     
-    // 3. Atualizar status do usuário para ativo (is_active = 1)
-    _, err = h.db.GetDB().ExecContext(ctx,
-        "UPDATE users SET is_active = 1 WHERE email = ? AND username = ?",
-        master.Email, master.Username)
-    
+    // 3. CORRIGIDO: Atualizar payment_status para sucesso (3)
+    log.Printf("Setting payment_status to success (3) for user: %s", master.Username)
+    err = h.db.SetPaymentProcessingSuccess(master.Email, master.Username)
     if err != nil {
-        return fmt.Errorf("failed to reactivate user: %v", err)
+        return fmt.Errorf("failed to set payment status to success: %v", err)
     }
     
     // 4. Atualizar status das subscriptions para ativa
@@ -451,7 +450,18 @@ func (h *UpdateCardHandler) updateAccountAfterCardUpdateWithProfile(ctx context.
     return nil
 }
 
-// Funções auxiliares mantidas (sem alterações)
+// CORRIGIDA: Função para verificar status de pagamento (USANDO PAYMENT_STATUS)
+func (h *UpdateCardHandler) checkUserPaymentErrorStatusFast(ctx context.Context, email, username string) (bool, error) {
+    paymentStatus, err := h.db.GetUserPaymentStatus(email, username)
+    if err != nil {
+        return false, fmt.Errorf("user not found or error getting payment status: %v", err)
+    }
+    
+    // payment_status = 1 significa erro de pagamento (precisa atualizar cartão)
+    return paymentStatus == int(models.PaymentStatusFailed), nil
+}
+
+// Funções auxiliares mantidas
 func (h *UpdateCardHandler) getMasterAccountDataFast(ctx context.Context, email, username string) (*models.MasterAccount, error) {
     query := `
         SELECT reference_uuid, name, lname, email, username, phone_number,
@@ -486,18 +496,6 @@ func (h *UpdateCardHandler) getMasterAccountDataFast(ctx context.Context, email,
     }
     
     return &account, nil
-}
-
-func (h *UpdateCardHandler) checkUserInactiveStatusFast(ctx context.Context, email, username string) (bool, error) {
-    var isActive int
-    query := "SELECT is_active FROM users WHERE email = ? AND username = ? LIMIT 1"
-    
-    err := h.db.GetDB().QueryRowContext(ctx, query, email, username).Scan(&isActive)
-    if err != nil {
-        return false, fmt.Errorf("user not found: %v", err)
-    }
-    
-    return isActive == 9, nil
 }
 
 func (h *UpdateCardHandler) convertMasterAccountToCheckoutData(master *models.MasterAccount) *models.CheckoutData {
@@ -573,7 +571,7 @@ func (h *UpdateCardHandler) sendCardUpdateConfirmationEmailAsync(ctx context.Con
     return h.emailService.SendEmail(email, subject, content)
 }
 
-// Helper methods para responses (mantidos)
+// Helper methods para responses
 func (h *UpdateCardHandler) sendErrorResponse(w http.ResponseWriter, status int, message string) {
     w.Header().Set("Content-Type", "application/json")
     w.WriteHeader(status)
@@ -590,7 +588,7 @@ func (h *UpdateCardHandler) sendSuccessResponse(w http.ResponseWriter, response 
     json.NewEncoder(w).Encode(response)
 }
 
-// Métodos de status mantidos
+// CORRIGIDOS: Métodos de status agora usando payment_status
 func (h *UpdateCardHandler) CheckAccountStatus(w http.ResponseWriter, r *http.Request) {
     ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
     defer cancel()
@@ -609,13 +607,10 @@ func (h *UpdateCardHandler) CheckAccountStatus(w http.ResponseWriter, r *http.Re
         return
     }
 
-    var isActive int
-    err = h.db.GetDB().QueryRowContext(ctx,
-        "SELECT is_active FROM users WHERE email = ? AND username = ? LIMIT 1",
-        email, username).Scan(&isActive)
-    
+    // CORRIGIDO: Usar payment_status em vez de is_active
+    paymentStatus, err := h.db.GetUserPaymentStatus(email, username)
     if err != nil {
-        h.sendErrorResponse(w, http.StatusNotFound, "User not found")
+        h.sendErrorResponse(w, http.StatusNotFound, "User payment status not found")
         return
     }
 
@@ -631,15 +626,16 @@ func (h *UpdateCardHandler) CheckAccountStatus(w http.ResponseWriter, r *http.Re
 
     response := map[string]interface{}{
         "status":              "success",
+        "payment_status":      paymentStatus,
         "account_status":      func() string {
-            switch isActive {
-            case 0: return "pending_activation"
-            case 1: return "active" 
-            case 9: return "payment_error"
+            switch paymentStatus {
+            case int(models.PaymentStatusProcessing): return "processing"
+            case int(models.PaymentStatusFailed): return "payment_error"
+            case int(models.PaymentStatusSuccess): return "active" 
             default: return "unknown"
             }
         }(),
-        "needs_card_update":   isActive == 9,
+        "needs_card_update":   paymentStatus == int(models.PaymentStatusFailed),
         "has_customer_profile": hasCustomerProfile,
         "customer_profile_id":  customerProfileID,
         "account_details": map[string]interface{}{
@@ -730,12 +726,16 @@ func (h *UpdateCardHandler) GetCardUpdateHistory(w http.ResponseWriter, r *http.
         }
     }
 
+    // CORRIGIDO: Buscar payment_status atual
+    paymentStatus, _ := h.db.GetUserPaymentStatus(email, username)
+
     response := map[string]interface{}{
         "status": "success",
         "account_info": map[string]interface{}{
-            "email":    masterAccount.Email,
-            "username": masterAccount.Username,
-            "name":     fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
+            "email":          masterAccount.Email,
+            "username":       masterAccount.Username,
+            "name":           fmt.Sprintf("%s %s", masterAccount.Name, masterAccount.LastName),
+            "payment_status": paymentStatus,
         },
         "customer_profile":   customerProfileInfo,
         "update_history":     updates,

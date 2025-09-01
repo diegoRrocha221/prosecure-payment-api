@@ -51,28 +51,30 @@ func NewJWTService(secretKey, issuer string, db *database.Connection) *JWTServic
     }
 }
 
-// Authenticate verifica credenciais e retorna informações do usuário autenticado
+// CORRIGIDO: Authenticate agora busca payment_status e usa para determinar account_type
 func (j *JWTService) Authenticate(username, password string) (*models.AuthResponse, error) {
     // Hash da senha usando SHA256 (compatível com o sistema PHP)
     hasher := sha256.New()
     hasher.Write([]byte(password))
     hashedPassword := hex.EncodeToString(hasher.Sum(nil))
 
-    // Buscar usuário no banco de dados
+    // CORRIGIDO: Buscar usuário no banco incluindo payment_status
     var emailConfirmed, isActive, isMaster int
     var email string
     var mfaEnabled bool
+    var paymentStatus sql.NullInt32 // Usar NullInt32 para tratar casos onde payment_status é NULL
 
     query := `
         SELECT u.email, u.email_confirmed, u.is_active, u.is_master,
-               COALESCE(ma.mfa_is_enable, 0) as mfa_enabled
+               COALESCE(ma.mfa_is_enable, 0) as mfa_enabled,
+               u.payment_status
         FROM users u
         LEFT JOIN master_accounts ma ON u.username = ma.username
         WHERE u.username = ? AND u.passphrase = ?
     `
 
     err := j.db.GetDB().QueryRow(query, username, hashedPassword).Scan(
-        &email, &emailConfirmed, &isActive, &isMaster, &mfaEnabled)
+        &email, &emailConfirmed, &isActive, &isMaster, &mfaEnabled, &paymentStatus)
 
     if err != nil {
         if err == sql.ErrNoRows {
@@ -86,10 +88,17 @@ func (j *JWTService) Authenticate(username, password string) (*models.AuthRespon
         return nil, ErrEmailNotConfirmed
     }
 
-    // Determinar tipo de conta baseado no status
-    accountType := j.determineAccountType(isActive, isMaster == 1)
+    // CORRIGIDO: Determinar tipo de conta baseado no payment_status se disponível
+    var finalPaymentStatus int
+    if paymentStatus.Valid {
+        finalPaymentStatus = int(paymentStatus.Int32)
+    } else {
+        finalPaymentStatus = -1 // Valor padrão quando payment_status é NULL
+    }
 
-    // Verificar se a conta está ativa
+    accountType := j.determineAccountType(isActive, isMaster == 1, finalPaymentStatus)
+
+    // Verificar se a conta está ativa (exceto para casos de payment_error)
     if accountType == "inactive" || accountType == "dea" {
         return nil, ErrUserInactive
     }
@@ -183,7 +192,7 @@ func (j *JWTService) ValidateToken(tokenString string) (*models.AuthUser, error)
     }, nil
 }
 
-// RefreshToken gera um novo access token usando um refresh token válido
+// CORRIGIDO: RefreshToken agora busca payment_status atual
 func (j *JWTService) RefreshToken(refreshTokenString string) (*models.AuthResponse, error) {
     token, err := jwt.ParseWithClaims(refreshTokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
         if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
@@ -209,20 +218,33 @@ func (j *JWTService) RefreshToken(refreshTokenString string) (*models.AuthRespon
         return nil, ErrInvalidToken
     }
 
-    // Verificar se o usuário ainda existe e está ativo
-    var isActive int
-    err = j.db.GetDB().QueryRow("SELECT is_active FROM users WHERE username = ?", claims.Username).Scan(&isActive)
+    // CORRIGIDO: Verificar se o usuário ainda existe e buscar payment_status atual
+    var isActive, isMaster int
+    var paymentStatus sql.NullInt32
+    
+    query := `SELECT is_active, is_master, payment_status FROM users WHERE username = ?`
+    err = j.db.GetDB().QueryRow(query, claims.Username).Scan(&isActive, &isMaster, &paymentStatus)
     if err != nil {
         return nil, ErrInvalidCredentials
     }
+
+    // Determinar account_type atualizado
+    var finalPaymentStatus int
+    if paymentStatus.Valid {
+        finalPaymentStatus = int(paymentStatus.Int32)
+    } else {
+        finalPaymentStatus = -1
+    }
+
+    accountType := j.determineAccountType(isActive, isMaster == 1, finalPaymentStatus)
 
     // Atualizar informações do usuário
     user := models.AuthUser{
         Username:    claims.Username,
         Email:       claims.Email,
-        IsMaster:    claims.IsMaster,
+        IsMaster:    isMaster == 1,
         IsActive:    isActive,
-        AccountType: j.determineAccountType(isActive, claims.IsMaster),
+        AccountType: accountType,
         MfaEnabled:  claims.MfaEnabled,
     }
 
@@ -246,8 +268,14 @@ func (j *JWTService) RefreshToken(refreshTokenString string) (*models.AuthRespon
     }, nil
 }
 
-// determineAccountType determina o tipo de conta baseado no status
-func (j *JWTService) determineAccountType(isActive int, isMaster bool) string {
+// CORRIGIDO: determineAccountType agora usa payment_status quando disponível
+func (j *JWTService) determineAccountType(isActive int, isMaster bool, paymentStatus int) string {
+    // Se payment_status está disponível e indica falha, usar payment_error
+    if paymentStatus == int(models.PaymentStatusFailed) {
+        return "payment_error"
+    }
+    
+    // Caso contrário, usar is_active como antes
     switch isActive {
     case 1:
         if isMaster {
@@ -257,23 +285,31 @@ func (j *JWTService) determineAccountType(isActive int, isMaster bool) string {
     case 2:
         return "dea"
     case 9:
-        return "payment_error"
+        // Manter compatibilidade: se payment_status não está disponível mas is_active = 9
+        if paymentStatus == -1 {
+            return "payment_error"
+        }
+        // Se payment_status está disponível mas não é falha, usar is_active
+        if isMaster {
+            return "master"
+        }
+        return "normal"
     default:
         return "inactive"
     }
 }
 
-// GetPaymentErrorInfo obtém informações de erro de pagamento (para contas com is_active = 9)
+// GetPaymentErrorInfo obtém informações de erro de pagamento
 func (j *JWTService) GetPaymentErrorInfo(username string) (*models.PaymentErrorInfo, error) {
     query := `
         SELECT u.username, u.email, ma.name, ma.lname, ma.total_price, ma.reference_uuid
         FROM users u
         JOIN master_accounts ma ON u.username = ma.username
-        WHERE u.username = ? AND u.is_active = 9
+        WHERE u.username = ? AND (u.payment_status = ? OR u.is_active = 9)
     `
 
     var info models.PaymentErrorInfo
-    err := j.db.GetDB().QueryRow(query, username).Scan(
+    err := j.db.GetDB().QueryRow(query, username, models.PaymentStatusFailed).Scan(
         &info.Username, &info.Email, &info.Name, &info.LastName,
         &info.TotalPrice, &info.ReferenceUUID,
     )

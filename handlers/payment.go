@@ -217,7 +217,6 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     log.Printf("[RequestID: %s] Account created successfully, scheduling payment processing", requestID)
 
     // AGENDAR: Processamento de pagamento (transação teste + void + ARB)
-    // TODO: ALTERAR PARA 1 HORA EM PRODUÇÃO (time.Hour)
     paymentDelay := 40 * time.Second // TESTE: 2 minutos | PRODUÇÃO: time.Hour
     
     ctx := context.Background()

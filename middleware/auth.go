@@ -107,7 +107,7 @@ func RequireActiveAccount() func(http.Handler) http.Handler {
     }
 }
 
-// AllowPaymentError permite acesso para contas com erro de pagamento (is_active = 9)
+// CORRIGIDO: AllowPaymentError permite acesso para contas com erro de pagamento (payment_status = 1)
 // Usado especificamente para endpoints de atualização de cartão
 func AllowPaymentError() func(http.Handler) http.Handler {
     return func(next http.Handler) http.Handler {
@@ -118,7 +118,8 @@ func AllowPaymentError() func(http.Handler) http.Handler {
                 return
             }
 
-            // Permitir acesso para contas normais, master e com erro de pagamento
+            // CORRIGIDO: Permitir acesso para contas normais, master e com erro de pagamento
+            // Agora baseado no payment_status em vez de is_active
             allowedTypes := []string{"normal", "master", "payment_error"}
             isAllowed := false
             for _, allowedType := range allowedTypes {

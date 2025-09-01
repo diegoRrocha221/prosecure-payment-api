@@ -304,12 +304,12 @@ func main() {
     
     // Update card público (mantido para compatibilidade)
     publicUpdateCardRouter := api.PathPrefix("/update-card").Subrouter()
-    publicUpdateCardRouter.Use(timeoutMiddleware(45 * time.Second))
+    publicUpdateCardRouter.Use(timeoutMiddleware(900 * time.Second))
     publicUpdateCardRouter.HandleFunc("", updateCardHandler.UpdateCard).Methods("POST", "OPTIONS")
     
     // Status endpoints públicos
     statusRouter := api.PathPrefix("").Subrouter()
-    statusRouter.Use(timeoutMiddleware(15 * time.Second))
+    statusRouter.Use(timeoutMiddleware(140 * time.Second))
     statusRouter.HandleFunc("/check-account-status", updateCardHandler.CheckAccountStatus).Methods("GET", "OPTIONS")
     statusRouter.HandleFunc("/card-update-history", updateCardHandler.GetCardUpdateHistory).Methods("GET", "OPTIONS")
     
@@ -392,14 +392,14 @@ func main() {
 
     // Configurar servidor HTTP
     srv := &http.Server{
-        Addr:         fmt.Sprintf(":%s", cfg.Server.Port),
-        Handler:      router,
-        ReadTimeout:  30 * time.Second,
-        WriteTimeout: 120 * time.Second,
-        IdleTimeout:  300 * time.Second,
-        ReadHeaderTimeout: 10 * time.Second,
+        Addr:              fmt.Sprintf(":%s", cfg.Server.Port),
+        Handler:           router,
+        ReadTimeout:       5 * time.Minute,
+        WriteTimeout:      20 * time.Minute, // precisa ser maior que o maior timeout de middleware
+        IdleTimeout:       30 * time.Minute,
+        ReadHeaderTimeout: 15 * time.Second,
         MaxHeaderBytes:    1 << 20,
-        ErrorLog: log.New(os.Stderr, "HTTP Server Error: ", log.LstdFlags),
+        ErrorLog:          log.New(os.Stderr, "HTTP Server Error: ", log.LstdFlags),
     }
 
     // Iniciar servidor
