@@ -158,10 +158,93 @@ func (w *Worker) processJob(job *queue.Job) error {
 	case queue.JobTypeCreateAccount:
 		return w.processCreateAccountJob(job)
 	case queue.JobTypeDelayedPayment:
-		return w.processDelayedPaymentJob(job) // Novo processador para pagamento com delay
+		return w.processDelayedPaymentJob(job)
+    case queue.JobTypeActivationEmail:  
+		return w.processActivationEmailJob(job)
 	default:
 		return fmt.Errorf("unknown job type: %s", job.Type)
 	}
+}
+
+func (w *Worker) processActivationEmailJob(job *queue.Job) error {
+	// Extrair dados do job
+	username, ok := job.Data["username"].(string)
+	if !ok || username == "" {
+		return fmt.Errorf("invalid username in activation email job data")
+	}
+
+	email, ok := job.Data["email"].(string)
+	if !ok || email == "" {
+		return fmt.Errorf("invalid email in activation email job data")
+	}
+
+	customerName, ok := job.Data["customer_name"].(string)
+	if !ok || customerName == "" {
+		return fmt.Errorf("invalid customer_name in activation email job data")
+	}
+
+	activationURL, ok := job.Data["activation_url"].(string)
+	if !ok || activationURL == "" {
+		return fmt.Errorf("invalid activation_url in activation email job data")
+	}
+
+	requestID, _ := job.Data["request_id"].(string)
+	if requestID == "" {
+		requestID = job.ID
+	}
+
+	log.Printf("[RequestID: %s] Processing activation email job for user: %s (%s)", 
+		requestID, username, email)
+
+	// Verificar se o usuário ainda existe e precisa de ativação
+	var userExists bool
+	var emailConfirmed int
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := w.db.GetDB().QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE username = ? AND email = ?), 
+		 COALESCE((SELECT email_confirmed FROM users WHERE username = ? AND email = ?), 0)`,
+		username, email, username, email).Scan(&userExists, &emailConfirmed)
+
+	if err != nil {
+		log.Printf("[RequestID: %s] Error checking user existence: %v", requestID, err)
+		return fmt.Errorf("failed to verify user existence: %v", err)
+	}
+
+	if !userExists {
+		log.Printf("[RequestID: %s] User %s no longer exists, skipping activation email", 
+			requestID, username)
+		return nil // Não é erro, usuário pode ter sido removido
+	}
+
+	if emailConfirmed == 1 {
+		log.Printf("[RequestID: %s] User %s already confirmed email, skipping activation email", 
+			requestID, username)
+		return nil // Usuário já ativou, não precisa enviar
+	}
+
+	// Preparar e enviar email de ativação
+	activationEmailContent := w.generateActivationEmail(customerName, activationURL)
+
+	log.Printf("[RequestID: %s] Sending delayed activation email to %s", requestID, email)
+
+	err = w.emailService.SendEmail(
+		email,
+		"Please Confirm Your Email Address",
+		activationEmailContent,
+	)
+
+	if err != nil {
+		log.Printf("[RequestID: %s] Failed to send activation email to %s: %v", 
+			requestID, email, err)
+		return fmt.Errorf("failed to send activation email: %v", err)
+	}
+
+	log.Printf("[RequestID: %s] Successfully sent delayed activation email to %s (%s)", 
+		requestID, email, username)
+	
+	return nil
 }
 
 // processDelayedPaymentJob - Processa apenas o PAGAMENTO (conta já foi criada)
@@ -1083,26 +1166,44 @@ func (w *Worker) createAccountsAndNotify(checkout *models.CheckoutData, cardData
         encodedUser, encodedEmail, encodedCode,
     )
 
-    // Preparar e enviar APENAS email de ativação
-    activationEmailContent := w.generateActivationEmail(checkout.Name, activationURL)
-
-    // Enviar email de ativação
-    activationErr := w.emailService.SendEmail(
-        checkout.Email,
-        "Please Confirm Your Email Address",
-        activationEmailContent,
-    )
+    // NOVO: AGENDAR envio do email de ativação com delay de 1min e 10s
+    activationDelay := 1*time.Minute + 10*time.Second
     
-    if activationErr != nil {
-        log.Printf("Warning: Failed to send activation email: %v", activationErr)
-        // Continua mesmo com erro no email - conta já foi criada
+    ctx := context.Background()
+    err = w.queue.EnqueueDelayed(ctx, queue.JobTypeActivationEmail, map[string]interface{}{
+        "username":       checkout.Username,
+        "email":          checkout.Email,
+        "customer_name":  checkout.Name,
+        "activation_url": activationURL,
+        "request_id":     fmt.Sprintf("worker-activation-%s", masterUUID),
+    }, activationDelay)
+    
+    if err != nil {
+        log.Printf("Warning: Failed to enqueue activation email job: %v", err)
+        
+        // FALLBACK: Enviar email imediatamente se falhar ao agendar
+        log.Printf("Fallback: Sending activation email immediately")
+        activationEmailContent := w.generateActivationEmail(checkout.Name, activationURL)
+        
+        activationErr := w.emailService.SendEmail(
+            checkout.Email,
+            "Please Confirm Your Email Address",
+            activationEmailContent,
+        )
+        
+        if activationErr != nil {
+            log.Printf("Warning: Failed to send immediate activation email: %v", activationErr)
+        } else {
+            log.Printf("Activation email sent immediately to %s (fallback)", checkout.Email)
+        }
     } else {
-        log.Printf("Activation email sent successfully to %s", checkout.Email)
+        log.Printf("Activation email scheduled to be sent in %v to %s", 
+            activationDelay, checkout.Email)
     }
     
     // NOTA: Email de invoice será enviado apenas após sucesso completo do pagamento no processDelayedPaymentJob
 
-    log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
+    log.Printf("Successfully created accounts and scheduled activation email for master reference: %s", masterUUID)
     return nil
 }
 

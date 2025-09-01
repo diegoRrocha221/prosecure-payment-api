@@ -217,7 +217,7 @@ func (h *PaymentHandler) ProcessPayment(w http.ResponseWriter, r *http.Request) 
     log.Printf("[RequestID: %s] Account created successfully, scheduling payment processing", requestID)
 
     // AGENDAR: Processamento de pagamento (transação teste + void + ARB)
-    paymentDelay := 40 * time.Second // TESTE: 2 minutos | PRODUÇÃO: time.Hour
+    paymentDelay :=  4 * time.Second 
     
     ctx := context.Background()
     err = h.queue.EnqueueDelayed(ctx, queue.JobTypeDelayedPayment, map[string]interface{}{
@@ -433,11 +433,13 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         return fmt.Errorf("failed to commit transaction: %v", err)
     }
 
+    // Gerar código de ativação e URLs
     code := utils.GenerateActivationCode()
     encodedUser := base64.StdEncoding.EncodeToString([]byte(checkout.Username))
     encodedEmail := base64.StdEncoding.EncodeToString([]byte(checkout.Email))
     encodedCode := base64.StdEncoding.EncodeToString([]byte(code))
 
+    // Atualizar código de ativação no banco
     go func() {
         updateErr := h.db.UpdateUserActivationCode(checkout.Email, checkout.Username, code)
         if updateErr != nil {
@@ -451,26 +453,44 @@ func (h *PaymentHandler) createAccountsAndNotify(checkout *models.CheckoutData, 
         encodedUser, encodedEmail, encodedCode,
     )
 
-    // Preparar e enviar APENAS email de ativação
-    activationEmailContent := h.generateActivationEmail(checkout.Name, activationURL)
-
-    // Enviar email de ativação
-    activationErr := h.emailService.SendEmail(
-        checkout.Email,
-        "Please Confirm Your Email Address",
-        activationEmailContent,
-    )
+    // NOVO: AGENDAR envio do email de ativação com delay de 1min e 10s
+    activationDelay := 1*time.Minute + 10*time.Second
     
-    if activationErr != nil {
-        log.Printf("Warning: Failed to send activation email: %v", activationErr)
-        // Continua mesmo com erro no email - conta já foi criada
+    ctx := context.Background()
+    err = h.queue.EnqueueDelayed(ctx, queue.JobTypeActivationEmail, map[string]interface{}{
+        "username":       checkout.Username,
+        "email":          checkout.Email,
+        "customer_name":  checkout.Name,
+        "activation_url": activationURL,
+        "request_id":     fmt.Sprintf("activation-%s", masterUUID),
+    }, activationDelay)
+    
+    if err != nil {
+        log.Printf("Warning: Failed to enqueue activation email job: %v", err)
+        
+        // FALLBACK: Enviar email imediatamente se falhar ao agendar
+        log.Printf("Fallback: Sending activation email immediately")
+        activationEmailContent := h.generateActivationEmail(checkout.Name, activationURL)
+        
+        activationErr := h.emailService.SendEmail(
+            checkout.Email,
+            "Please Confirm Your Email Address",
+            activationEmailContent,
+        )
+        
+        if activationErr != nil {
+            log.Printf("Warning: Failed to send immediate activation email: %v", activationErr)
+        } else {
+            log.Printf("Activation email sent immediately to %s (fallback)", checkout.Email)
+        }
     } else {
-        log.Printf("Activation email sent successfully to %s", checkout.Email)
+        log.Printf("Activation email scheduled to be sent in %v to %s", 
+            activationDelay, checkout.Email)
     }
     
     // NOTA: Email de invoice será enviado apenas após sucesso completo do pagamento
 
-    log.Printf("Successfully created accounts and sent notifications for master reference: %s", masterUUID)
+    log.Printf("Successfully created accounts and scheduled activation email for master reference: %s", masterUUID)
     return nil
 }
 

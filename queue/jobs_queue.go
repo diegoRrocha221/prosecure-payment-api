@@ -17,7 +17,8 @@ const (
 	JobTypeCreateSubscription JobType = "create_subscription"
 	JobTypeProcessPayment     JobType = "process_payment"     
 	JobTypeCreateAccount      JobType = "create_account"
-	JobTypeDelayedPayment     JobType = "delayed_payment"     // Novo tipo para pagamento com delay
+	JobTypeDelayedPayment     JobType = "delayed_payment"
+	JobTypeActivationEmail    JobType = "activation_email"
 )
 
 type Job struct {
