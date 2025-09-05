@@ -107,13 +107,20 @@ func (h *AddPlansHandler) PreviewAddPlans(w http.ResponseWriter, r *http.Request
     // Buscar dados da conta master
     masterAccount, err := h.getMasterAccountData(user.Username, user.Email)
     if err != nil {
+        log.Printf("Error getting master account for user %s: %v", user.Username, err)
         utils.SendErrorResponse(w, http.StatusNotFound, "Account not found")
         return
     }
 
+    // CORREÇÃO: Verificar trial ANTES de calcular custos
+    isTrial := masterAccount.IsTrial == 1
+    log.Printf("PREVIEW DEBUG: User %s - IsTrial from DB: %d, isTrial bool: %t", 
+        user.Username, masterAccount.IsTrial, isTrial)
+
     // Determinar se é usuário anual baseado no purchased_plans JSON
     isAnnualUser, err := h.isAnnualUser(masterAccount.PurchasedPlans)
     if err != nil {
+        log.Printf("Error determining billing type for user %s: %v", user.Username, err)
         utils.SendErrorResponse(w, http.StatusInternalServerError, "Error determining billing type")
         return
     }
@@ -121,18 +128,20 @@ func (h *AddPlansHandler) PreviewAddPlans(w http.ResponseWriter, r *http.Request
     // Calcular custos sem processar pagamento
     planCalculations, totalProRata, totalMonthlyIncrease, err := h.calculatePlansFromDatabase(req.Cart, isAnnualUser, masterAccount.RenewDate)
     if err != nil {
+        log.Printf("Error calculating plans for user %s: %v", user.Username, err)
         utils.SendErrorResponse(w, http.StatusBadRequest, err.Error())
         return
     }
 
     userType := "monthly"
-    isTrial := masterAccount.IsTrial == 1
-    
     if isTrial {
         userType = "trial"
     } else if isAnnualUser {
         userType = "annual"
     }
+
+    log.Printf("PREVIEW DEBUG: User %s - UserType: %s, IsAnnual: %t, IsTrial: %t", 
+        user.Username, userType, isAnnualUser, isTrial)
 
     response := AddPlansResponse{
         Success:         true,
@@ -147,8 +156,10 @@ func (h *AddPlansHandler) PreviewAddPlans(w http.ResponseWriter, r *http.Request
     if isTrial {
         response.ProRataCharged = 0.0
         response.TrialMessage = "You're in your 30-day free trial period! Add as many plans as you want - they'll be added to your next bill with no immediate charges."
+        log.Printf("PREVIEW DEBUG: Trial user %s detected - ProRataCharged set to 0.0", user.Username)
     } else {
         response.ProRataCharged = totalProRata
+        log.Printf("PREVIEW DEBUG: Non-trial user %s - ProRataCharged: %.2f", user.Username, totalProRata)
     }
 
     utils.SendSuccessResponse(w, models.APIResponse{
@@ -190,7 +201,12 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 2. Determinar se é usuário anual baseado no purchased_plans JSON
+    // 2. Verificar se é trial PRIMEIRO
+    isTrial := masterAccount.IsTrial == 1
+    log.Printf("ADD PLANS DEBUG: User %s - IsTrial from DB: %d, isTrial bool: %t", 
+        user.Username, masterAccount.IsTrial, isTrial)
+
+    // 3. Determinar se é usuário anual baseado no purchased_plans JSON
     isAnnualUser, err := h.isAnnualUser(masterAccount.PurchasedPlans)
     if err != nil {
         log.Printf("Error determining billing type: %v", err)
@@ -198,11 +214,9 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 3. Verificar se é trial
-    isTrial := masterAccount.IsTrial == 1
-    
     // 4. VALIDAÇÃO CVV: Só obrigatório para não-trial
     if !isTrial && (req.CVV == "" || len(req.CVV) < 3 || len(req.CVV) > 4) {
+        log.Printf("CVV validation failed for non-trial user %s: CVV=%s", user.Username, req.CVV)
         utils.SendErrorResponse(w, http.StatusBadRequest, "Valid CVV is required")
         return
     }
@@ -224,6 +238,8 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
             utils.SendErrorResponse(w, http.StatusBadRequest, "No charges calculated")
             return
         }
+
+        log.Printf("Processing payment for non-trial user %s - Amount: %.2f", user.Username, totalProRata)
 
         // Buscar Customer Profile
         customerProfile, err := h.db.GetCustomerProfile(masterAccount.ReferenceUUID)
@@ -247,7 +263,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         // TRIAL: Sem cobrança
         transactionID = fmt.Sprintf("TRIAL-ADD-%d", time.Now().Unix())
         chargedAmount = 0.0
-        log.Printf("User %s is in trial - skipping payment", user.Username)
+        log.Printf("User %s is in trial - skipping payment, using transaction ID: %s", user.Username, transactionID)
     }
 
     // 7. Atualizar dados no banco de dados
@@ -258,11 +274,15 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 8. Atualizar ARB subscription com novo valor
+    // 8. Atualizar ARB subscription com novo valor (somente se não for trial)
     newMonthlyTotal := masterAccount.TotalPrice + totalMonthlyIncrease
-    err = h.updateARBSubscription(masterAccount.ReferenceUUID, newMonthlyTotal)
-    if err != nil {
-        log.Printf("Warning: Failed to update ARB subscription: %v", err)
+    if !isTrial {
+        err = h.updateARBSubscription(masterAccount.ReferenceUUID, newMonthlyTotal)
+        if err != nil {
+            log.Printf("Warning: Failed to update ARB subscription: %v", err)
+        }
+    } else {
+        log.Printf("Skipping ARB subscription update for trial user %s", user.Username)
     }
 
     userType := "monthly"
@@ -286,6 +306,7 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
 
     if isTrial {
         response.Message = "Plans added successfully! Since you're in your trial period, no charges were applied."
+        log.Printf("Trial user %s - plans added without charge", user.Username)
     }
 
     utils.SendSuccessResponse(w, models.APIResponse{
@@ -422,9 +443,18 @@ func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.
         &account.SimultaneousUsers, &account.RenewDate, &isTrial,
     )
     
+    if err != nil {
+        log.Printf("Error querying master account for %s/%s: %v", username, email, err)
+        return nil, err
+    }
+    
     account.IsTrial = isTrial
 
-    return &account, err
+    // ADICIONAR LOG PARA DEBUG
+    log.Printf("DEBUG: Master account data - Username: %s, IsTrial: %d, IsAnnually: %d, ReferenceUUID: %s", 
+        account.Username, account.IsTrial, account.IsAnnually, account.ReferenceUUID)
+
+    return &account, nil
 }
 
 // CORRIGIDO: Incluir CVV no método de cobrança
