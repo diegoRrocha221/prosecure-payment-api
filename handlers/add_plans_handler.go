@@ -52,6 +52,8 @@ type AddPlansResponse struct {
     NewMonthlyTotal  float64            `json:"new_monthly_total"`
     PlanDetails      []PlanCalculation  `json:"plan_details"`
     UserType         string             `json:"user_type"`
+    IsTrial          bool               `json:"is_trial"`
+    TrialMessage     string             `json:"trial_message,omitempty"`
 }
 
 type PurchasedPlan struct {
@@ -96,6 +98,7 @@ func (h *AddPlansHandler) PreviewAddPlans(w http.ResponseWriter, r *http.Request
                 ProRataCharged:  0,
                 MonthlyIncrease: 0,
                 PlanDetails:     []PlanCalculation{},
+                IsTrial:         false,
             },
         })
         return
@@ -123,17 +126,29 @@ func (h *AddPlansHandler) PreviewAddPlans(w http.ResponseWriter, r *http.Request
     }
 
     userType := "monthly"
-    if isAnnualUser {
+    isTrial := masterAccount.IsTrial == 1
+    
+    if isTrial {
+        userType = "trial"
+    } else if isAnnualUser {
         userType = "annual"
     }
 
     response := AddPlansResponse{
         Success:         true,
-        ProRataCharged:  totalProRata,
         MonthlyIncrease: totalMonthlyIncrease,
         NewMonthlyTotal: masterAccount.TotalPrice + totalMonthlyIncrease,
         PlanDetails:     planCalculations,
         UserType:        userType,
+        IsTrial:         isTrial,
+    }
+
+    // LÓGICA TRIAL: Se é trial, não cobrar pro-rata
+    if isTrial {
+        response.ProRataCharged = 0.0
+        response.TrialMessage = "You're in your 30-day free trial period! Add as many plans as you want - they'll be added to your next bill with no immediate charges."
+    } else {
+        response.ProRataCharged = totalProRata
     }
 
     utils.SendSuccessResponse(w, models.APIResponse{
@@ -165,12 +180,6 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // CRÍTICO: Validar CVV
-    if req.CVV == "" || len(req.CVV) < 3 || len(req.CVV) > 4 {
-        utils.SendErrorResponse(w, http.StatusBadRequest, "Valid CVV is required")
-        return
-    }
-
     log.Printf("Processing add plans for user: %s, cart items: %d", user.Username, len(req.Cart))
 
     // 1. Buscar dados da conta master
@@ -189,15 +198,16 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 3. Buscar Customer Profile
-    customerProfile, err := h.db.GetCustomerProfile(masterAccount.ReferenceUUID)
-    if err != nil {
-        log.Printf("Error getting customer profile: %v", err)
-        utils.SendErrorResponse(w, http.StatusNotFound, "Customer profile not found")
+    // 3. Verificar se é trial
+    isTrial := masterAccount.IsTrial == 1
+    
+    // 4. VALIDAÇÃO CVV: Só obrigatório para não-trial
+    if !isTrial && (req.CVV == "" || len(req.CVV) < 3 || len(req.CVV) > 4) {
+        utils.SendErrorResponse(w, http.StatusBadRequest, "Valid CVV is required")
         return
     }
 
-    // 4. Buscar planos do banco de dados e calcular custos
+    // 5. Buscar planos do banco de dados e calcular custos
     planCalculations, totalProRata, totalMonthlyIncrease, err := h.calculatePlansFromDatabase(req.Cart, isAnnualUser, masterAccount.RenewDate)
     if err != nil {
         log.Printf("Error calculating plans: %v", err)
@@ -205,29 +215,50 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    if totalProRata <= 0 {
-        utils.SendErrorResponse(w, http.StatusBadRequest, "No charges calculated")
-        return
+    var transactionID string
+    var chargedAmount float64
+
+    // 6. COBRANÇA: Só para não-trial
+    if !isTrial {
+        if totalProRata <= 0 {
+            utils.SendErrorResponse(w, http.StatusBadRequest, "No charges calculated")
+            return
+        }
+
+        // Buscar Customer Profile
+        customerProfile, err := h.db.GetCustomerProfile(masterAccount.ReferenceUUID)
+        if err != nil {
+            log.Printf("Error getting customer profile: %v", err)
+            utils.SendErrorResponse(w, http.StatusNotFound, "Customer profile not found")
+            return
+        }
+
+        // Fazer cobrança pro-rata usando Customer Profile COM CVV
+        transactionID, err = h.chargeCustomerProfile(customerProfile.AuthorizeCustomerProfileID, 
+            customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount, req.CVV)
+        if err != nil {
+            log.Printf("Error charging customer profile: %v", err)
+            utils.SendErrorResponse(w, http.StatusPaymentRequired, fmt.Sprintf("Payment failed: %v", err))
+            return
+        }
+        chargedAmount = totalProRata
+        log.Printf("Payment successful for user %s - Amount: %.2f, Transaction: %s", user.Username, totalProRata, transactionID)
+    } else {
+        // TRIAL: Sem cobrança
+        transactionID = fmt.Sprintf("TRIAL-ADD-%d", time.Now().Unix())
+        chargedAmount = 0.0
+        log.Printf("User %s is in trial - skipping payment", user.Username)
     }
 
-    // 5. Fazer cobrança pro-rata usando Customer Profile COM CVV
-    transactionID, err := h.chargeCustomerProfile(customerProfile.AuthorizeCustomerProfileID, 
-        customerProfile.AuthorizePaymentProfileID, totalProRata, masterAccount, req.CVV)
-    if err != nil {
-        log.Printf("Error charging customer profile: %v", err)
-        utils.SendErrorResponse(w, http.StatusPaymentRequired, fmt.Sprintf("Payment failed: %v", err))
-        return
-    }
-
-    // 6. Atualizar dados no banco de dados
-    err = h.updateAccountWithNewPlans(masterAccount, req.Cart, planCalculations, totalMonthlyIncrease, transactionID, isAnnualUser, totalProRata)
+    // 7. Atualizar dados no banco de dados
+    err = h.updateAccountWithNewPlans(masterAccount, req.Cart, planCalculations, totalMonthlyIncrease, transactionID, isAnnualUser, chargedAmount, isTrial)
     if err != nil {
         log.Printf("Error updating account: %v", err)
         utils.SendErrorResponse(w, http.StatusInternalServerError, "Failed to update account")
         return
     }
 
-    // 7. Atualizar ARB subscription com novo valor
+    // 8. Atualizar ARB subscription com novo valor
     newMonthlyTotal := masterAccount.TotalPrice + totalMonthlyIncrease
     err = h.updateARBSubscription(masterAccount.ReferenceUUID, newMonthlyTotal)
     if err != nil {
@@ -235,24 +266,31 @@ func (h *AddPlansHandler) AddPlans(w http.ResponseWriter, r *http.Request) {
     }
 
     userType := "monthly"
-    if isAnnualUser {
+    if isTrial {
+        userType = "trial"
+    } else if isAnnualUser {
         userType = "annual"
     }
 
     response := AddPlansResponse{
         Success:           true,
         Message:          "Plans added successfully",
-        ProRataCharged:   totalProRata,
+        ProRataCharged:   chargedAmount,
         MonthlyIncrease:  totalMonthlyIncrease,
         TransactionID:    transactionID,
         NewMonthlyTotal:  newMonthlyTotal,
         PlanDetails:      planCalculations,
         UserType:         userType,
+        IsTrial:          isTrial,
+    }
+
+    if isTrial {
+        response.Message = "Plans added successfully! Since you're in your trial period, no charges were applied."
     }
 
     utils.SendSuccessResponse(w, models.APIResponse{
         Status:  "success",
-        Message: "Plans added successfully",
+        Message: response.Message,
         Data:    response,
     })
 }
@@ -367,20 +405,24 @@ func (h *AddPlansHandler) getMasterAccountData(username, email string) (*models.
     query := `
         SELECT reference_uuid, name, lname, email, username, phone_number,
                state, city, street, zip_code, additional_info, total_price,
-               is_annually, plan, purchased_plans, simultaneus_users, renew_date
+               is_annually, plan, purchased_plans, simultaneus_users, renew_date,
+               COALESCE(is_trial, 0) as is_trial
         FROM master_accounts 
         WHERE username = ? AND email = ?
     `
 
     var account models.MasterAccount
+    var isTrial int
     err := h.db.GetDB().QueryRow(query, username, email).Scan(
         &account.ReferenceUUID, &account.Name, &account.LastName,
         &account.Email, &account.Username, &account.PhoneNumber,
         &account.State, &account.City, &account.Street,
         &account.ZipCode, &account.AdditionalInfo, &account.TotalPrice,
         &account.IsAnnually, &account.Plan, &account.PurchasedPlans,
-        &account.SimultaneousUsers, &account.RenewDate,
+        &account.SimultaneousUsers, &account.RenewDate, &isTrial,
     )
+    
+    account.IsTrial = isTrial
 
     return &account, err
 }
@@ -393,7 +435,7 @@ func (h *AddPlansHandler) chargeCustomerProfile(customerProfileID, paymentProfil
     return h.paymentService.ChargeCustomerProfile(customerProfileID, paymentProfileID, amount, cvv)
 }
 
-func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool, totalProRata float64) error {
+func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccount, cart []CartPlan, planCalculations []PlanCalculation, monthlyIncrease float64, transactionID string, isAnnualUser bool, chargedAmount float64, isTrial bool) error {
     tx, err := h.db.BeginTransaction()
     if err != nil {
         return fmt.Errorf("failed to begin transaction: %v", err)
@@ -464,30 +506,33 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
         return fmt.Errorf("failed to update master account: %v", err)
     }
 
-    // Registrar transação
+    // Registrar transação (mesmo para trial com valor 0)
     ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
     defer cancel()
     
     _, err = h.db.GetDB().ExecContext(ctx, `
         INSERT INTO transactions (id, master_reference, checkout_id, amount, status, transaction_id, created_at)
         VALUES (UUID(), ?, 'ADD_PLANS', ?, 'captured', ?, NOW())`,
-        account.ReferenceUUID, utils.Round(totalProRata), transactionID)
+        account.ReferenceUUID, utils.Round(chargedAmount), transactionID)
     
     if err != nil {
         return fmt.Errorf("failed to save transaction: %v", err)
     }
 
-    // 1. CRIAR INVOICE DO PRO-RATA (PAGA)
-    _, err = h.db.GetDB().ExecContext(ctx, `
-        INSERT INTO invoices (master_reference, is_trial, total, due_date, is_paid, created_at)
-        VALUES (?, 0, ?, NOW(), 1, NOW())`,
-        account.ReferenceUUID, utils.Round(totalProRata))
-    
-    if err != nil {
-        return fmt.Errorf("failed to create prorata invoice: %v", err)
+    // INVOICES: Diferente para trial vs normal
+    if !isTrial && chargedAmount > 0 {
+        // CRIAR INVOICE DO PRO-RATA (PAGA) - só para não-trial
+        _, err = h.db.GetDB().ExecContext(ctx, `
+            INSERT INTO invoices (master_reference, is_trial, total, due_date, is_paid, created_at)
+            VALUES (?, 0, ?, NOW(), 1, NOW())`,
+            account.ReferenceUUID, utils.Round(chargedAmount))
+        
+        if err != nil {
+            return fmt.Errorf("failed to create prorata invoice: %v", err)
+        }
     }
 
-    // 2. ATUALIZAR OU CRIAR INVOICE DO PRÓXIMO MES/ANO (PENDING)
+    // ATUALIZAR OU CRIAR INVOICE DO PRÓXIMO PERÍODO (trial ou normal)
     dueDate := time.Now().AddDate(0, 1, 0)
     if isAnnualUser {
         dueDate = time.Now().AddDate(1, 0, 0)
@@ -515,10 +560,14 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
         log.Printf("Updated existing future invoice %s with new total: %.2f", existingInvoiceID, newFutureTotal)
     } else {
         // Criar nova invoice future
+        isTrialFlag := 0
+        if isTrial {
+            isTrialFlag = 1
+        }
         _, err = h.db.GetDB().ExecContext(ctx, `
             INSERT INTO invoices (master_reference, is_trial, total, due_date, is_paid, created_at)
-            VALUES (?, 0, ?, ?, 0, NOW())`,
-            account.ReferenceUUID, utils.Round(monthlyIncrease), dueDate)
+            VALUES (?, ?, ?, ?, 0, NOW())`,
+            account.ReferenceUUID, isTrialFlag, utils.Round(monthlyIncrease), dueDate)
         
         if err != nil {
             return fmt.Errorf("failed to create future invoice: %v", err)
@@ -530,17 +579,69 @@ func (h *AddPlansHandler) updateAccountWithNewPlans(account *models.MasterAccoun
         return fmt.Errorf("failed to commit transaction: %v", err)
     }
 
-    // 3. ENVIAR EMAIL DA INVOICE PRO-RATA (APÓS COMMIT)
+    // ENVIAR EMAIL: Diferente para trial vs normal
     go func() {
-        err := h.sendProRataInvoiceEmail(account, planCalculations, totalProRata)
-        if err != nil {
-            log.Printf("Warning: Failed to send prorata invoice email: %v", err)
-        } else {
-            log.Printf("Pro-rata invoice email sent successfully to %s", account.Email)
+        if isTrial {
+            err := h.sendTrialAdditionEmail(account, planCalculations, monthlyIncrease)
+            if err != nil {
+                log.Printf("Warning: Failed to send trial addition email: %v", err)
+            } else {
+                log.Printf("Trial addition email sent successfully to %s", account.Email)
+            }
+        } else if chargedAmount > 0 {
+            err := h.sendProRataInvoiceEmail(account, planCalculations, chargedAmount)
+            if err != nil {
+                log.Printf("Warning: Failed to send prorata invoice email: %v", err)
+            } else {
+                log.Printf("Pro-rata invoice email sent successfully to %s", account.Email)
+            }
         }
     }()
 
     return nil
+}
+
+func (h *AddPlansHandler) sendTrialAdditionEmail(account *models.MasterAccount, planCalculations []PlanCalculation, monthlyIncrease float64) error {
+    // Gerar tabela de planos adicionados
+    plansTable := `<table class="plans-table">
+        <thead>
+            <tr>
+                <th>Plan Name</th>
+                <th>Quantity</th>
+                <th>Monthly Price</th>
+            </tr>
+        </thead>
+        <tbody>`
+    
+    for _, plan := range planCalculations {
+        plansTable += fmt.Sprintf(`
+            <tr>
+                <td>%s</td>
+                <td>%d</td>
+                <td>$%.2f</td>
+            </tr>`, 
+            plan.PlanName,
+            plan.Quantity,
+            plan.MonthlyPrice,
+        )
+    }
+    plansTable += `</tbody></table>`
+
+    emailContent := fmt.Sprintf(`
+        <h2>Plans Added During Free Trial</h2>
+        <p>Hello %s!</p>
+        <p>Great news! We've added new plans to your account at no cost since you're in your 30-day free trial period.</p>
+        %s
+        <p><strong>Added to your monthly bill:</strong> $%.2f</p>
+        <p><strong>Immediate charge:</strong> $0.00 (Free trial benefit)</p>
+        <p>Your billing will automatically begin after your trial expires. Enjoy exploring your new plans!</p>
+    `, account.Name, plansTable, monthlyIncrease)
+
+    return h.emailService.SendEmail(
+        account.Email,
+        "New Plans Added - Free Trial",
+        emailContent,
+    )
 }
 
 func (h *AddPlansHandler) sendProRataInvoiceEmail(account *models.MasterAccount, planCalculations []PlanCalculation, totalProRata float64) error {
